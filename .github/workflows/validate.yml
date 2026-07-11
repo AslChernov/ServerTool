@@ -71,4 +71,15 @@ jobs:
           BLOCKLIST_URLS=()
           GEO_COUNTRIES=""
           EOF
-          sudo /usr/local/sbin/server-tool-guard-update --check
+          set +e
+          output=$(sudo /usr/local/sbin/server-tool-guard-update --check 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if ((status != 0)); then
+            message=${output//'%'/'%25'}
+            message=${message//$'\r'/'%0D'}
+            message=${message//$'\n'/'%0A'}
+            echo "::error file=server_tool.sh,title=nftables validation::${message}"
+          fi
+          exit "$status"
