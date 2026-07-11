@@ -11,11 +11,29 @@ jobs:
   shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Check Bash syntax
         run: bash -n server_tool.sh
       - name: Run ShellCheck
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
-          shellcheck --severity=warning server_tool.sh
+          set +e
+          shellcheck --severity=warning --format=json1 server_tool.sh > /tmp/shellcheck.json
+          status=$?
+          set -e
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          for item in json.loads(Path("/tmp/shellcheck.json").read_text() or "[]"):
+              level = "error" if item["level"] == "error" else "warning"
+              title = f"SC{item['code']}"
+              message = item["message"].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(
+                  f"::{level} file={item['file']},line={item['line']},col={item['column']},"
+                  f"endLine={item['endLine']},endColumn={item['endColumn']},title={title}::{message}"
+              )
+          PY
+          exit "$status"
