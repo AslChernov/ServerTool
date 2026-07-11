@@ -303,11 +303,13 @@ table inet $TABLE {
     type ipv4_addr
     flags interval
     auto-merge
-    elements = {
 EOF
-    sed 's/$/,/' "$CACHE"
+    if ((count > 0)); then
+        echo '    elements = {'
+        sed 's/^/      /; s/$/,/' "$CACHE"
+        echo '    }'
+    fi
     cat <<EOF
-    }
   }
   set panel_v4 {
     type ipv4_addr
