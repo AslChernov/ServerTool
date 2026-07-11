@@ -103,7 +103,8 @@ ensure_packages() {
 }
 
 make_backup() {
-    local label="$1" dir="${BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)-${label}"
+    local label="$1" dir
+    dir="${BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)-${label}"
     mkdir -p "$dir"
     chmod 700 "$dir"
     printf '%s\n' "$dir"
@@ -472,8 +473,8 @@ generate_ssh_key() {
 }
 
 random_free_port() {
-    local port attempt
-    for attempt in {1..100}; do
+    local port
+    for _ in {1..100}; do
         port=$(shuf -i 20000-60999 -n 1)
         ss -H -ltn "sport = :$port" 2>/dev/null | grep -q . || { printf '%s\n' "$port"; return; }
     done
