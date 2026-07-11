@@ -27,7 +27,9 @@ jobs:
           import json
           from pathlib import Path
 
-          for item in json.loads(Path("/tmp/shellcheck.json").read_text() or "[]"):
+          payload = json.loads(Path("/tmp/shellcheck.json").read_text() or "{}")
+          items = payload.get("comments", []) if isinstance(payload, dict) else payload
+          for item in items:
               level = "error" if item["level"] == "error" else "warning"
               title = f"SC{item['code']}"
               message = item["message"].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
