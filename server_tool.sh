@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly VERSION="2.0.0"
+readonly VERSION="3.0.0"
 readonly APP_NAME="ServerTool"
 readonly CONFIG_DIR="/etc/server-tool"
 readonly BACKUP_ROOT="/var/backups/server-tool"
@@ -14,7 +14,11 @@ readonly SSH_DROPIN="/etc/ssh/sshd_config.d/00-server-tool.conf"
 readonly GUARD_CONFIG="${CONFIG_DIR}/guard.conf"
 readonly GUARD_UPDATER="/usr/local/sbin/server-tool-guard-update"
 readonly GUARD_SERVICE="/etc/systemd/system/server-tool-guard.service"
+readonly GUARD_UPDATE_SERVICE="/etc/systemd/system/server-tool-guard-update.service"
 readonly GUARD_TIMER="/etc/systemd/system/server-tool-guard.timer"
+readonly GUARD_CACHE="/var/lib/server-tool/blocklist-v4.txt"
+readonly CROWDSEC_ACQUIS="/etc/crowdsec/acquis.d/server-tool.yaml"
+readonly CROWDSEC_FORWARD="/usr/local/sbin/server-tool-crowdsec-forward"
 readonly DEFAULT_PANEL_IP="45.148.62.18"
 readonly DEFAULT_NODE_PORT="2222"
 
@@ -119,8 +123,6 @@ detect_ssh_port() {
     valid_port "${port:-}" && printf '%s\n' "$port" || printf '22\n'
 }
 
-ufw_active() { ufw status 2>/dev/null | grep -q '^Status: active'; }
-
 system_update() {
     require_root
     step "Обновление системы"
@@ -146,7 +148,7 @@ choose_https_mode() {
 
 configure_firewall() {
     require_root
-    ensure_packages ufw nftables python3 curl ca-certificates
+    ensure_packages nftables python3 curl ca-certificates
     local ssh_port https_mode node_port panel_ip backup
     ssh_port=$(detect_ssh_port)
     info "Обнаружен SSH-порт: ${ssh_port}/tcp"
@@ -162,94 +164,105 @@ configure_firewall() {
     printf '  🔐 SSH:             %s/tcp — для всех\n' "$ssh_port"
     printf '  🌐 VPN 443:         %s\n' "$https_mode"
     printf '  🧩 Remnawave API:   %s/tcp — только %s\n' "$node_port" "$panel_ip"
-    warn "UFW будет сброшен. Остальные входящие правила будут удалены."
+    warn "Будет включён единый nftables-firewall. Все неразрешённые входящие и Docker-порты будут закрыты."
     confirm "Продолжить?" || { warn "Отменено."; return 0; }
 
     backup=$(make_backup firewall)
+    nft list ruleset > "$backup/nft-ruleset.txt" 2>&1 || true
     cp -a /etc/default/ufw "$backup/" 2>/dev/null || true
     cp -a /etc/ufw "$backup/" 2>/dev/null || true
     ufw status numbered > "$backup/ufw-status.txt" 2>&1 || true
-    sed -Ei 's/^IPV6=.*/IPV6=no/' /etc/default/ufw
-    ufw --force reset
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw limit "$ssh_port/tcp" comment "SSH"
-    ufw allow proto tcp from "$panel_ip" to any port "$node_port" comment "Remnawave API"
-    case $https_mode in
-        both) ufw allow 443/tcp comment "VPN HTTPS"; ufw allow 443/udp comment "VPN QUIC/UDP" ;;
-        tcp)  ufw allow 443/tcp comment "VPN HTTPS" ;;
-        udp)  ufw allow 443/udp comment "VPN UDP" ;;
-    esac
-    ufw logging low
-    ufw --force enable
-    write_guard_config "$node_port" "$panel_ip"
+
+    write_guard_config "$ssh_port" "$node_port" "$panel_ip" "$https_mode"
     install_guard_runtime
+
+    # The new firewall is already active. Now remove UFW without flushing unrelated nftables tables.
+    if command -v ufw >/dev/null 2>&1; then
+        ufw --force disable >/dev/null 2>&1 || true
+        systemctl disable --now ufw.service >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y ufw >/dev/null || warn "UFW отключён, но пакет не удалось удалить."
+        "$GUARD_UPDATER" --apply
+    fi
+
     success "Firewall настроен. Резервная копия: ${backup}"
-    printf '\n'; ufw status numbered
+    printf '\n'; nft list table inet server_tool_guard
     log INFO "firewall configured ssh=${ssh_port} https=${https_mode} node=${node_port} panel=${panel_ip}"
 }
 
 write_guard_config() {
-    local node_port="$1" panel_ip="$2"
+    local ssh_port="$1" node_port="$2" panel_ip="$3" https_mode="$4" geo_countries=""
+    if [[ -r $GUARD_CONFIG ]]; then
+        geo_countries=$(awk -F= '$1 == "GEO_COUNTRIES" {gsub(/\"/, "", $2); print $2; exit}' "$GUARD_CONFIG")
+    fi
     mkdir -p "$CONFIG_DIR"
     cat > "$GUARD_CONFIG" <<EOF
 # Managed by ServerTool. Shell syntax; root-writable only.
+SSH_PORT="${ssh_port}"
 NODE_PORT="${node_port}"
 PANEL_IPV4="${panel_ip}"
+HTTPS_MODE="${https_mode}"
 BLOCKLIST_URLS=(
   "https://cdn.jsdelivr.net/gh/shadow-netlab/traffic-guard-lists@main/public/antiscanner.list"
   "https://cdn.jsdelivr.net/gh/shadow-netlab/traffic-guard-lists@main/public/government_networks.list"
 )
 # Optional ISO 3166-1 alpha-2 country codes, separated by spaces.
-GEO_COUNTRIES=""
+GEO_COUNTRIES="${geo_countries}"
 EOF
     chmod 600 "$GUARD_CONFIG"
 }
 
 install_guard_runtime() {
     mkdir -p "$CONFIG_DIR"
-    [[ -f $GUARD_CONFIG ]] || write_guard_config "$DEFAULT_NODE_PORT" "$DEFAULT_PANEL_IP"
+    [[ -f $GUARD_CONFIG ]] || write_guard_config "$(detect_ssh_port)" "$DEFAULT_NODE_PORT" "$DEFAULT_PANEL_IP" both
     cat > "$GUARD_UPDATER" <<'GUARD_SCRIPT'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
 CONFIG=/etc/server-tool/guard.conf
 TABLE=server_tool_guard
+CACHE=/var/lib/server-tool/blocklist-v4.txt
 [[ -r $CONFIG ]] || { echo "Missing $CONFIG" >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$CONFIG"
+[[ ${SSH_PORT:-} =~ ^[0-9]+$ ]] && ((SSH_PORT >= 1 && SSH_PORT <= 65535)) || exit 1
 [[ ${NODE_PORT:-} =~ ^[0-9]+$ ]] && ((NODE_PORT >= 1 && NODE_PORT <= 65535)) || exit 1
+[[ ${HTTPS_MODE:-} =~ ^(both|tcp|udp|none)$ ]] || exit 1
 python3 - "$PANEL_IPV4" <<'PY' >/dev/null
 import ipaddress, sys
 n = ipaddress.ip_network(sys.argv[1], strict=False)
 assert n.version == 4
 PY
+mkdir -p /var/lib/server-tool
 work=$(mktemp -d /run/server-tool-guard.XXXXXX)
 trap 'rm -rf "$work"' EXIT
-: > "$work/raw"
-downloaded=0
-for url in "${BLOCKLIST_URLS[@]:-}"; do
-    if curl --fail --silent --show-error --location --max-time 45 "$url" >> "$work/raw"; then
-        downloaded=$((downloaded + 1)); printf '\n' >> "$work/raw"
+if [[ ${1:---apply} == --refresh ]]; then
+    : > "$work/raw"
+    downloaded=0
+    expected=${#BLOCKLIST_URLS[@]}
+    for url in "${BLOCKLIST_URLS[@]:-}"; do
+        if curl --fail --silent --show-error --location --max-time 45 "$url" >> "$work/raw"; then
+            downloaded=$((downloaded + 1)); printf '\n' >> "$work/raw"
+        else
+            echo "Warning: could not download $url" >&2
+        fi
+    done
+    geo_codes=()
+    IFS=' ' read -r -a geo_codes <<< "${GEO_COUNTRIES:-}"
+    for cc in "${geo_codes[@]}"; do
+        [[ -n $cc ]] || continue
+        [[ $cc =~ ^[a-zA-Z]{2}$ ]] || continue
+        expected=$((expected + 1))
+        url="https://www.ipdeny.com/ipblocks/data/countries/${cc,,}.zone"
+        if curl --fail --silent --show-error --location --max-time 45 "$url" >> "$work/raw"; then
+            downloaded=$((downloaded + 1)); printf '\n' >> "$work/raw"
+        fi
+    done
+    if ((downloaded == 0)); then
+        [[ -s $CACHE ]] || { echo "No list source and no cache; core firewall will use an empty blocklist." >&2; : > "$CACHE"; }
+    elif ((downloaded < expected)) && [[ -s $CACHE ]]; then
+        echo "Only $downloaded of $expected sources downloaded; keeping cached blocklist." >&2
     else
-        echo "Warning: could not download $url" >&2
-    fi
-done
-geo_codes=()
-IFS=' ' read -r -a geo_codes <<< "${GEO_COUNTRIES:-}"
-for cc in "${geo_codes[@]}"; do
-    [[ -n $cc ]] || continue
-    [[ $cc =~ ^[a-zA-Z]{2}$ ]] || continue
-    url="https://www.ipdeny.com/ipblocks/data/countries/${cc,,}.zone"
-    if curl --fail --silent --show-error --location --max-time 45 "$url" >> "$work/raw"; then
-        downloaded=$((downloaded + 1)); printf '\n' >> "$work/raw"
-    fi
-done
-if ((downloaded == 0)); then
-    echo "No blocklist source was downloaded; keeping current nftables table." >&2
-    exit 1
-fi
-python3 - "$work/raw" "$work/collapsed" <<'PY'
+        python3 - "$work/raw" "$work/collapsed" <<'PY'
 import ipaddress, sys
 nets = []
 with open(sys.argv[1], encoding="utf-8", errors="ignore") as source:
@@ -270,8 +283,19 @@ with open(sys.argv[2], "w", encoding="ascii") as target:
     for net in ipaddress.collapse_addresses(nets):
         target.write(f"{net}\n")
 PY
-count=$(wc -l < "$work/collapsed")
-((count >= 10)) || { echo "Only $count valid networks received; keeping current rules." >&2; exit 1; }
+        count=$(wc -l < "$work/collapsed")
+        if ((count >= 10)); then
+            install -m 600 "$work/collapsed" "$CACHE"
+        elif [[ ! -s $CACHE ]]; then
+            echo "Only $count valid networks and no cache; refusing update." >&2
+            exit 1
+        else
+            echo "Only $count valid networks; keeping cached blocklist." >&2
+        fi
+    fi
+fi
+touch "$CACHE"
+count=$(wc -l < "$CACHE")
 {
     nft list table inet "$TABLE" >/dev/null 2>&1 && echo "delete table inet $TABLE"
     cat <<EOF
@@ -282,7 +306,7 @@ table inet $TABLE {
     auto-merge
     elements = {
 EOF
-    sed 's/$/,/' "$work/collapsed"
+    sed 's/$/,/' "$CACHE"
     cat <<EOF
     }
   }
@@ -291,40 +315,83 @@ EOF
     flags interval
     elements = { $PANEL_IPV4 }
   }
-  chain input_guard {
-    type filter hook input priority -20; policy accept;
-    ip saddr @panel_v4 counter accept
-    ip saddr @blocked_v4 counter drop
-    tcp dport $NODE_PORT counter drop
+  chain input {
+    type filter hook input priority -20; policy drop;
+    iifname "lo" counter accept
+    iifname "docker0" counter accept
+    iifname "br-*" counter accept
+    ct state invalid counter drop
+    ct state established,related counter accept
+    meta l4proto ipv6-icmp counter accept
+    meta nfproto ipv4 ip protocol icmp limit rate 10/second counter accept
+    meta nfproto ipv4 udp sport 67 udp dport 68 counter accept
+    meta nfproto ipv4 ip saddr @panel_v4 tcp dport $NODE_PORT counter accept
+    meta nfproto ipv4 ip saddr @blocked_v4 counter drop
+    meta nfproto ipv4 tcp dport $SSH_PORT counter accept
+EOF
+    case "$HTTPS_MODE" in
+        both) echo '    meta nfproto ipv4 tcp dport 443 counter accept'; echo '    meta nfproto ipv4 udp dport 443 counter accept' ;;
+        tcp)  echo '    meta nfproto ipv4 tcp dport 443 counter accept' ;;
+        udp)  echo '    meta nfproto ipv4 udp dport 443 counter accept' ;;
+    esac
+    cat <<EOF
+    counter drop
   }
-  chain forward_guard {
+  chain forward {
     type filter hook forward priority -20; policy accept;
-    ip saddr @panel_v4 counter accept
+    ct state invalid counter drop
+    meta nfproto ipv4 ip saddr @panel_v4 meta l4proto tcp ct original proto-dst $NODE_PORT counter accept
     ip saddr @blocked_v4 counter drop
+    ct state established,related counter accept
+    iifname "docker0" counter accept
+    iifname "br-*" counter accept
     meta l4proto tcp ct original proto-dst $NODE_PORT counter drop
     tcp dport $NODE_PORT counter drop
+EOF
+    case "$HTTPS_MODE" in
+        both) echo '    meta l4proto tcp ct original proto-dst 443 counter accept'; echo '    meta l4proto udp ct original proto-dst 443 counter accept' ;;
+        tcp)  echo '    meta l4proto tcp ct original proto-dst 443 counter accept' ;;
+        udp)  echo '    meta l4proto udp ct original proto-dst 443 counter accept' ;;
+    esac
+    cat <<EOF
+    ct status dnat counter drop
   }
 }
 EOF
 } > "$work/rules.nft"
 nft --check --file "$work/rules.nft"
+if [[ ${1:-} == --check ]]; then
+    echo "nftables syntax is valid"
+    exit 0
+fi
 nft --file "$work/rules.nft"
-echo "Loaded $count IPv4 networks into inet/$TABLE"
+echo "Applied nftables firewall with $count blocked IPv4 networks"
 GUARD_SCRIPT
     chmod 750 "$GUARD_UPDATER"
     cat > "$GUARD_SERVICE" <<EOF
 [Unit]
-Description=ServerTool nftables guard for Remnawave
-Wants=network-online.target
-After=network-online.target ufw.service docker.service
+Description=ServerTool nftables firewall for Remnawave
+After=local-fs.target
+Before=docker.service
 
 [Service]
 Type=oneshot
-ExecStart=${GUARD_UPDATER}
-TimeoutStartSec=3min
+ExecStart=${GUARD_UPDATER} --apply
+RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
+EOF
+    cat > "$GUARD_UPDATE_SERVICE" <<EOF
+[Unit]
+Description=Refresh ServerTool nftables blocklists
+Wants=network-online.target
+After=network-online.target server-tool-guard.service
+
+[Service]
+Type=oneshot
+ExecStart=${GUARD_UPDATER} --refresh
+TimeoutStartSec=3min
 EOF
     cat > "$GUARD_TIMER" <<EOF
 [Unit]
@@ -335,29 +402,33 @@ OnBootSec=10min
 OnUnitActiveSec=1d
 RandomizedDelaySec=30min
 Persistent=true
-Unit=server-tool-guard.service
+Unit=server-tool-guard-update.service
 
 [Install]
 WantedBy=timers.target
 EOF
     systemctl daemon-reload
     systemctl enable server-tool-guard.service server-tool-guard.timer >/dev/null
-    if systemctl start server-tool-guard.service; then
+    if "$GUARD_UPDATER" --refresh; then
+        systemctl restart server-tool-guard.service >/dev/null
         systemctl enable --now server-tool-guard.timer >/dev/null
-        success "nftables-защита активна; списки обновляются ежедневно."
+        success "Единый nftables-firewall активен; списки обновляются ежедневно."
     else
-        warn "Не удалось загрузить списки. UFW уже настроен; повторите обновление позже."
+        "$GUARD_UPDATER" --apply
+        systemctl restart server-tool-guard.service >/dev/null
+        systemctl enable --now server-tool-guard.timer >/dev/null
+        warn "Firewall активен с кэшированным/пустым списком; сетевые списки обновятся позже."
     fi
 }
 
 guard_menu() {
     require_root
     ensure_packages nftables python3 curl ca-certificates
-    local choice node_port panel_ip countries
+    local choice countries
     while true; do
         clear
         printf '%b🛡️  NFTABLES-ЗАЩИТА%b\n\n' "$BOLD" "$NC"
-        printf '  1) Установить/переустановить защиту\n'
+        printf '  1) Настроить/переустановить firewall\n'
         printf '  2) Обновить списки сейчас\n'
         printf '  3) Настроить Geo-block по кодам стран\n'
         printf '  4) Показать статус и счётчики\n'
@@ -366,28 +437,30 @@ guard_menu() {
         read -r -p "Выбор: " choice || true
         case $choice in
             1)
-                read -r -p "Порт ноды [${DEFAULT_NODE_PORT}]: " node_port || true
-                node_port=${node_port:-$DEFAULT_NODE_PORT}
-                read -r -p "IPv4/CIDR панели [${DEFAULT_PANEL_IP}]: " panel_ip || true
-                panel_ip=${panel_ip:-$DEFAULT_PANEL_IP}
-                valid_port "$node_port" && valid_ipv4_cidr "$panel_ip" || { error "Некорректные данные."; pause; continue; }
-                write_guard_config "$node_port" "$panel_ip"
-                install_guard_runtime
+                configure_firewall
                 pause
                 ;;
             2)
-                [[ -x $GUARD_UPDATER ]] || install_guard_runtime
-                "$GUARD_UPDATER" && success "Списки обновлены."
+                if [[ ! -r $GUARD_CONFIG || ! -x $GUARD_UPDATER ]]; then
+                    error "Сначала настройте firewall через пункт 1."
+                    pause
+                    continue
+                fi
+                "$GUARD_UPDATER" --refresh && success "Списки обновлены, firewall применён."
                 pause
                 ;;
             3)
-                [[ -f $GUARD_CONFIG ]] || write_guard_config "$DEFAULT_NODE_PORT" "$DEFAULT_PANEL_IP"
+                if [[ ! -f $GUARD_CONFIG ]]; then
+                    error "Сначала настройте firewall через пункт 1."
+                    pause
+                    continue
+                fi
                 read -r -p "Коды стран через пробел (например: cn ir); пусто = отключить: " countries || true
                 if [[ -n $countries ]] && ! [[ $countries =~ ^([a-zA-Z]{2})([[:space:]]+[a-zA-Z]{2})*$ ]]; then
                     error "Используйте двухбуквенные коды стран через пробел."
                 else
                     sed -Ei "s/^GEO_COUNTRIES=.*/GEO_COUNTRIES=\"${countries,,}\"/" "$GUARD_CONFIG"
-                    install_guard_runtime
+                    "$GUARD_UPDATER" --refresh
                 fi
                 pause
                 ;;
@@ -397,15 +470,205 @@ guard_menu() {
                 pause
                 ;;
             5)
-                if confirm "Удалить таблицу ServerTool, сервис и таймер?"; then
-                    systemctl disable --now server-tool-guard.timer server-tool-guard.service 2>/dev/null || true
+                warn "После удаления сервер останется без основного входящего firewall."
+                if confirm "Удалить таблицу ServerTool, сервисы и таймер?"; then
+                    systemctl disable --now server-tool-guard.timer server-tool-guard-update.service server-tool-guard.service 2>/dev/null || true
                     nft delete table inet server_tool_guard 2>/dev/null || true
-                    rm -f "$GUARD_UPDATER" "$GUARD_SERVICE" "$GUARD_TIMER"
+                    rm -f "$GUARD_UPDATER" "$GUARD_SERVICE" "$GUARD_UPDATE_SERVICE" "$GUARD_TIMER"
                     systemctl daemon-reload
-                    success "nftables-защита удалена. UFW не изменён."
+                    success "Основной nftables-firewall удалён."
                 fi
                 pause
                 ;;
+            0) return ;;
+            *) warn "Неизвестный пункт."; sleep 1 ;;
+        esac
+    done
+}
+
+crowdsec_installed() {
+    command -v cscli >/dev/null 2>&1 && dpkg-query -W -f='${Status}' crowdsec 2>/dev/null | grep -q 'ok installed'
+}
+
+write_crowdsec_limits() {
+    local ram_mb high_mb max_mb go_limit
+    ram_mb=$(awk '/MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+    if ((ram_mb < 1800)); then
+        high_mb=160; max_mb=256
+    elif ((ram_mb < 3800)); then
+        high_mb=256; max_mb=384
+    else
+        high_mb=384; max_mb=512
+    fi
+    go_limit=$((max_mb * 3 / 4))
+    mkdir -p /etc/systemd/system/crowdsec.service.d /etc/systemd/system/crowdsec-firewall-bouncer.service.d
+    cat > /etc/systemd/system/crowdsec.service.d/server-tool.conf <<EOF
+[Service]
+Environment=GOGC=50
+Environment=GOMEMLIMIT=${go_limit}MiB
+MemoryHigh=${high_mb}M
+MemoryMax=${max_mb}M
+OOMScoreAdjust=-500
+EOF
+    cat > /etc/systemd/system/crowdsec-firewall-bouncer.service.d/server-tool.conf <<EOF
+[Service]
+MemoryHigh=96M
+MemoryMax=160M
+OOMScoreAdjust=-400
+ExecStartPost=${CROWDSEC_FORWARD}
+EOF
+}
+
+write_crowdsec_forward_helper() {
+    cat > "$CROWDSEC_FORWARD" <<'CROWDSEC_FORWARD_SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+for _ in {1..20}; do
+    nft list table ip crowdsec >/dev/null 2>&1 && break
+    sleep 1
+done
+nft list table ip crowdsec >/dev/null 2>&1 || exit 0
+set_name=$(nft list table ip crowdsec | awk '$1 == "set" {print $2; exit}')
+[[ -n $set_name ]] || exit 0
+if ! nft list chain ip crowdsec crowdsec-forward >/dev/null 2>&1; then
+    nft add chain ip crowdsec crowdsec-forward '{ type filter hook forward priority -10; policy accept; }'
+fi
+if ! nft list chain ip crowdsec crowdsec-forward | grep -Fq "@$set_name"; then
+    nft add rule ip crowdsec crowdsec-forward ip saddr "@$set_name" counter drop
+fi
+CROWDSEC_FORWARD_SCRIPT
+    chmod 750 "$CROWDSEC_FORWARD"
+}
+
+configure_crowdsec_acquisition() {
+    local nginx_container=""
+    mkdir -p /etc/crowdsec/acquis.d
+    if command -v docker >/dev/null 2>&1; then
+        nginx_container=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(remnanode.*nginx|nginx.*|.*-nginx-.*)$' | head -n 1) || true
+    fi
+    if [[ -n $nginx_container && $nginx_container =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+        cat > "$CROWDSEC_ACQUIS" <<EOF
+source: docker
+container_name:
+  - ${nginx_container}
+labels:
+  type: nginx
+EOF
+        success "Подключены Docker-логи Nginx: ${nginx_container}"
+    else
+        rm -f "$CROWDSEC_ACQUIS"
+        warn "Nginx-контейнер Remnawave не найден. SSH будет защищён; Nginx можно подключить позже."
+    fi
+}
+
+install_crowdsec() {
+    require_root
+    ensure_packages curl gpg ca-certificates apt-transport-https
+    local key_tmp collection candidate
+    crowdsec_installed && warn "CrowdSec уже установлен; пакет и конфигурация будут обновлены."
+    step "Подключение официального репозитория CrowdSec"
+    key_tmp=$(mktemp)
+    curl -fsSL https://packagecloud.io/crowdsec/crowdsec/gpgkey -o "$key_tmp"
+    mkdir -p /etc/apt/keyrings /etc/apt/preferences.d
+    gpg --batch --yes --dearmor -o /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg "$key_tmp"
+    rm -f "$key_tmp"
+    cat > /etc/apt/sources.list.d/crowdsec_crowdsec.list <<'EOF'
+deb [signed-by=/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg] https://packagecloud.io/crowdsec/crowdsec/any any main
+EOF
+    cat > /etc/apt/preferences.d/crowdsec <<'EOF'
+Package: *
+Pin: release o=packagecloud.io/crowdsec/crowdsec,a=any,n=any,c=main
+Pin-Priority: 1001
+EOF
+    apt-get update
+    candidate=$(apt-cache policy crowdsec | awk '/Candidate:/ {print $2; exit}')
+    [[ -n $candidate && $candidate != '(none)' ]] || { error "CrowdSec недоступен из официального репозитория."; return 1; }
+    DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec crowdsec-firewall-bouncer-nftables
+
+    cscli hub update
+    for collection in crowdsecurity/linux crowdsecurity/sshd crowdsecurity/nginx; do
+        cscli collections install "$collection" >/dev/null 2>&1 || true
+    done
+    configure_crowdsec_acquisition
+    mkdir -p /etc/crowdsec/bouncers
+    cat > /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml.local <<'EOF'
+mode: nftables
+disable_ipv6: true
+nftables:
+  ipv4:
+    enabled: true
+    set-only: false
+    table: crowdsec
+    chain: crowdsec-chain
+  ipv6:
+    enabled: false
+EOF
+    write_crowdsec_forward_helper
+    write_crowdsec_limits
+    systemctl daemon-reload
+    systemctl enable crowdsec crowdsec-firewall-bouncer >/dev/null
+    systemctl restart crowdsec
+    systemctl restart crowdsec-firewall-bouncer
+    sleep 1
+    if systemctl is-active --quiet crowdsec && systemctl is-active --quiet crowdsec-firewall-bouncer; then
+        success "CrowdSec и nftables-bouncer активны."
+        cscli bouncers list || true
+    else
+        error "CrowdSec установлен, но один из сервисов не запустился."
+        systemctl --no-pager --full status crowdsec crowdsec-firewall-bouncer || true
+        return 1
+    fi
+    log INFO "CrowdSec installed with nftables bouncer"
+}
+
+remove_crowdsec() {
+    warn "Будут удалены CrowdSec, bouncer и их nftables-таблицы. Основной ServerTool firewall сохранится."
+    confirm "Удалить CrowdSec?" || return 0
+    systemctl disable --now crowdsec-firewall-bouncer crowdsec >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y crowdsec-firewall-bouncer-nftables crowdsec
+    rm -f /etc/apt/sources.list.d/crowdsec_crowdsec.list \
+        /etc/apt/preferences.d/crowdsec \
+        /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg \
+        "$CROWDSEC_FORWARD" "$CROWDSEC_ACQUIS"
+    rm -rf /etc/systemd/system/crowdsec.service.d /etc/systemd/system/crowdsec-firewall-bouncer.service.d
+    nft delete table ip crowdsec 2>/dev/null || true
+    nft delete table ip6 crowdsec6 2>/dev/null || true
+    systemctl daemon-reload
+    success "CrowdSec удалён; основной nftables-firewall не изменён."
+}
+
+crowdsec_menu() {
+    local choice
+    while true; do
+        clear
+        printf '%b🕵️  CROWDSEC%b\n\n' "$BOLD" "$NC"
+        if crowdsec_installed && systemctl is-active --quiet crowdsec; then
+            success "CrowdSec активен"
+        else
+            warn "CrowdSec не активен"
+        fi
+        printf '\n  1) Установить/обновить CrowdSec\n'
+        printf '  2) Подключить заново Nginx-контейнер\n'
+        printf '  3) Показать метрики и решения\n'
+        printf '  4) Удалить CrowdSec\n'
+        printf '  0) Назад\n\n'
+        read -r -p "Выбор: " choice || true
+        case $choice in
+            1) install_crowdsec; pause ;;
+            2)
+                crowdsec_installed || { error "Сначала установите CrowdSec."; pause; continue; }
+                configure_crowdsec_acquisition
+                systemctl restart crowdsec
+                pause
+                ;;
+            3)
+                crowdsec_installed || { error "CrowdSec не установлен."; pause; continue; }
+                cscli metrics || true
+                cscli decisions list || true
+                nft list table ip crowdsec 2>/dev/null || true
+                pause
+                ;;
+            4) remove_crowdsec; pause ;;
             0) return ;;
             *) warn "Неизвестный пункт."; sleep 1 ;;
         esac
@@ -497,7 +760,7 @@ restore_ssh_backup() {
 configure_ssh() {
     require_root
     ensure_packages openssh-server openssh-client iproute2
-    local old_port new_port user backup disable_password has_key choice file restart_ok
+    local old_port new_port user backup disable_password has_key choice file restart_ok firewall_config_changed
     old_port=$(detect_ssh_port)
     user=$(target_user_prompt) || { error "Пользователь не найден."; return 1; }
     new_port=$(random_free_port) || { error "Не удалось подобрать свободный порт."; return 1; }
@@ -542,8 +805,17 @@ EOF
         error "Проверка sshd не прошла; конфигурация восстановлена."
         return 1
     fi
-    if command -v ufw >/dev/null && ufw_active; then
-        ufw allow "$new_port/tcp" comment "SSH"
+    firewall_config_changed=no
+    if [[ -r $GUARD_CONFIG && -x $GUARD_UPDATER ]]; then
+        cp -a "$GUARD_CONFIG" "$backup/firewall.conf"
+        sed -Ei "s/^SSH_PORT=.*/SSH_PORT=\"${new_port}\"/" "$GUARD_CONFIG"
+        if ! "$GUARD_UPDATER" --apply; then
+            cp -a "$backup/firewall.conf" "$GUARD_CONFIG"
+            restore_ssh_backup "$backup"
+            error "Не удалось открыть новый SSH-порт в nftables; изменения отменены."
+            return 1
+        fi
+        firewall_config_changed=yes
     fi
     systemctl daemon-reload
     restart_ok=yes
@@ -553,6 +825,10 @@ EOF
     systemctl restart ssh.service || restart_ok=no
     if [[ $restart_ok != yes ]]; then
         restore_ssh_backup "$backup"
+        if [[ $firewall_config_changed == yes ]]; then
+            cp -a "$backup/firewall.conf" "$GUARD_CONFIG"
+            "$GUARD_UPDATER" --apply || true
+        fi
         systemctl daemon-reload
         if systemctl is-active --quiet ssh.socket; then
             systemctl restart ssh.socket || true
@@ -640,31 +916,63 @@ install_xanmod() {
     log INFO "xanmod installed package=${package}"
 }
 
+configure_bbr() {
+    require_root
+    ensure_packages iproute2 kmod
+    step "Настройка BBR и сетевой очереди fq"
+    modprobe tcp_bbr 2>/dev/null || { error "Текущее ядро не содержит модуль tcp_bbr. Сначала установите XanMod или другое совместимое ядро."; return 1; }
+    printf 'tcp_bbr\n' > /etc/modules-load.d/server-tool-bbr.conf
+    cat > /etc/sysctl.d/99-server-tool-network.conf <<'EOF'
+# Managed by ServerTool
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_mtu_probing = 1
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 8192
+EOF
+    sysctl --load /etc/sysctl.d/99-server-tool-network.conf >/dev/null
+    if [[ $(sysctl -n net.ipv4.tcp_congestion_control) == bbr ]]; then
+        success "BBR активирован. XanMod использует собственную актуальную реализацию BBR."
+    else
+        error "Ядро не приняло BBR; проверьте доступные алгоритмы: sysctl net.ipv4.tcp_available_congestion_control"
+        return 1
+    fi
+    log INFO "BBR network profile applied"
+}
+
 show_status() {
     clear
     printf '%b📊 СОСТОЯНИЕ НОДЫ%b\n\n' "$BOLD" "$NC"
     printf 'ОС:          %s\n' "$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-unknown}")"
     printf 'Ядро:        %s\n' "$(uname -r)"
     printf 'SSH-порт:    %s/tcp\n' "$(detect_ssh_port)"
-    if command -v ufw >/dev/null; then ufw status verbose || true; else printf 'UFW:         не установлен\n'; fi
-    printf '\n'
+    printf 'BBR:         %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 'unknown')"
     if nft list table inet server_tool_guard >/dev/null 2>&1; then
-        printf 'nft guard:   активен\n'
+        printf 'nft firewall: активен\n'
         systemctl list-timers server-tool-guard.timer --no-pager 2>/dev/null || true
     else
-        printf 'nft guard:   не активен\n'
+        printf 'nft firewall: не активен\n'
+    fi
+    if crowdsec_installed && systemctl is-active --quiet crowdsec; then
+        printf 'CrowdSec:    активен\n'
+    else
+        printf 'CrowdSec:    не активен\n'
     fi
     [[ ! -f /var/run/reboot-required ]] || warn "Требуется перезагрузка."
 }
 
 full_setup() {
-    warn "Мастер последовательно предложит обновление, SSH, firewall/nftables и XanMod."
+    warn "Мастер последовательно предложит обновление, SSH, nftables, CrowdSec, XanMod и BBR."
     confirm "Запустить полный мастер?" || return 0
     confirm "Обновить систему сейчас?" Y && system_update
     info "Сначала добавьте/создайте ключ, затем настройте порт SSH."
     ssh_menu
     configure_firewall
+    confirm "Установить CrowdSec?" && install_crowdsec
     confirm "Установить XanMod?" && install_xanmod
+    confirm "Включить BBR?" Y && configure_bbr
     success "Мастер завершён. Проверьте статус и новый SSH-вход до выхода из текущей сессии."
 }
 
@@ -689,11 +997,13 @@ show_menu() {
         printf '%b╚══════════════════════════════════════════╝%b\n\n' "$CYAN" "$NC"
         printf '  1) 🧰 Полная рекомендуемая настройка\n'
         printf '  2) 🔄 Обновить систему\n'
-        printf '  3) 🔥 Настроить UFW и порты ноды\n'
+        printf '  3) 🔥 Настроить nftables и порты ноды\n'
         printf '  4) 🔑 Настроить SSH\n'
-        printf '  5) 🛡️  nftables: Anti-Scanner и Geo-block\n'
-        printf '  6) ⚡ Установить XanMod\n'
-        printf '  7) 📊 Показать состояние\n'
+        printf '  5) 🛡️  Firewall, Anti-Scanner и Geo-block\n'
+        printf '  6) 🕵️  CrowdSec\n'
+        printf '  7) ⚡ Установить XanMod\n'
+        printf '  8) 🚄 Включить BBR\n'
+        printf '  9) 📊 Показать состояние\n'
         printf '  0) 👋 Выход\n\n'
         read -r -p "Выберите пункт: " choice || true
         case $choice in
@@ -702,8 +1012,10 @@ show_menu() {
             3) configure_firewall; pause ;;
             4) ssh_menu ;;
             5) guard_menu ;;
-            6) install_xanmod; pause ;;
-            7) show_status; pause ;;
+            6) crowdsec_menu ;;
+            7) install_xanmod; pause ;;
+            8) configure_bbr; pause ;;
+            9) show_status; pause ;;
             0) success "Готово. Не забудьте проверить новый SSH-вход."; return ;;
             *) warn "Неизвестный пункт."; sleep 1 ;;
         esac

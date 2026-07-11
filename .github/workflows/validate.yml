@@ -13,14 +13,33 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Check Bash syntax
-        run: bash -n server_tool.sh
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("server_tool.sh").read_text()
+          for marker, target in (
+              ("GUARD_SCRIPT", "/tmp/server-tool-guard-update"),
+              ("CROWDSEC_FORWARD_SCRIPT", "/tmp/server-tool-crowdsec-forward"),
+          ):
+              start = source.index(f"<<'{marker}'")
+              start = source.index("\n", start) + 1
+              end = source.index(f"\n{marker}\n", start)
+              Path(target).write_text(source[start:end] + "\n")
+          PY
+          bash -n server_tool.sh
+          bash -n /tmp/server-tool-guard-update
+          bash -n /tmp/server-tool-crowdsec-forward
       - name: Run ShellCheck
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y nftables shellcheck
           set +e
-          shellcheck --severity=warning --format=json1 server_tool.sh > /tmp/shellcheck.json
+          shellcheck --severity=warning --format=json1 \
+            server_tool.sh \
+            /tmp/server-tool-guard-update \
+            /tmp/server-tool-crowdsec-forward > /tmp/shellcheck.json
           status=$?
           set -e
           python3 - <<'PY'
@@ -39,3 +58,17 @@ jobs:
               )
           PY
           exit "$status"
+      - name: Validate generated nftables rules
+        run: |
+          sudo install -d -m 700 /etc/server-tool /var/lib/server-tool
+          sudo install -m 755 /tmp/server-tool-guard-update /usr/local/sbin/server-tool-guard-update
+          sudo touch /var/lib/server-tool/blocklist-v4.txt
+          sudo tee /etc/server-tool/guard.conf >/dev/null <<'EOF'
+          SSH_PORT="35425"
+          NODE_PORT="2222"
+          PANEL_IPV4="45.148.62.18"
+          HTTPS_MODE="both"
+          BLOCKLIST_URLS=()
+          GEO_COUNTRIES=""
+          EOF
+          sudo /usr/local/sbin/server-tool-guard-update --check
