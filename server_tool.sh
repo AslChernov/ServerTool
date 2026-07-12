@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly VERSION="3.0.0"
+readonly APP_VERSION="3.0.8"
 readonly APP_NAME="ServerTool"
 readonly CONFIG_DIR="/etc/server-tool"
 readonly BACKUP_ROOT="/var/backups/server-tool"
@@ -18,8 +18,13 @@ readonly GUARD_UPDATE_SERVICE="/etc/systemd/system/server-tool-guard-update.serv
 readonly GUARD_TIMER="/etc/systemd/system/server-tool-guard.timer"
 readonly CROWDSEC_ACQUIS="/etc/crowdsec/acquis.d/server-tool.yaml"
 readonly CROWDSEC_FORWARD="/usr/local/sbin/server-tool-crowdsec-forward"
+readonly CROWDSEC_BOUNCER_CONFIG="/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
+readonly CROWDSEC_BOUNCER_LOCAL="${CROWDSEC_BOUNCER_CONFIG}.local"
+readonly CROWDSEC_BOUNCER_NAME="server-tool-firewall-bouncer"
 readonly DEFAULT_PANEL_IP="45.148.62.18"
 readonly DEFAULT_NODE_PORT="2222"
+readonly REMNAWAVE_NGINX_CONTAINER="remnawave-nginx"
+readonly REMNANODE_CONTAINER="remnanode"
 
 if [[ -t 1 ]]; then
     readonly RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[1;33m'
@@ -69,7 +74,10 @@ require_root() {
 }
 
 require_supported_os() {
+    local ID="" VERSION="" VERSION_ID="" PRETTY_NAME=""
     [[ -r /etc/os-release ]] || die "Не удалось определить операционную систему."
+    # Load OS metadata into function-local variables so names such as VERSION
+    # cannot collide with ServerTool's own constants.
     # shellcheck disable=SC1091
     source /etc/os-release
     case "${ID:-}" in
@@ -94,9 +102,10 @@ PY
 }
 
 ensure_packages() {
-    local missing=() package
+    local missing=() package status
     for package in "$@"; do
-        dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'ok installed' || missing+=("$package")
+        status=$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)
+        [[ $status == *"ok installed"* ]] || missing+=("$package")
     done
     if ((${#missing[@]})); then
         step "Установка пакетов: ${missing[*]}"
@@ -114,10 +123,12 @@ make_backup() {
 }
 
 detect_ssh_port() {
-    local port
-    port=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}') || true
+    local port output
+    output=$(sshd -T 2>/dev/null || true)
+    port=$(awk '$1 == "port" {print $2; exit}' <<< "$output")
     if ! valid_port "${port:-}"; then
-        port=$(ss -ltnp 2>/dev/null | awk '/sshd/ {sub(/^.*:/, "", $4); print $4; exit}') || true
+        output=$(ss -ltnp 2>/dev/null || true)
+        port=$(awk '/sshd/ {sub(/^.*:/, "", $4); print $4; exit}' <<< "$output")
     fi
     valid_port "${port:-}" && printf '%s\n' "$port" || printf '22\n'
 }
@@ -427,7 +438,7 @@ guard_menu() {
     ensure_packages nftables python3 curl ca-certificates
     local choice countries
     while true; do
-        clear
+        clear 2>/dev/null || true
         printf '%b🛡️  NFTABLES-ЗАЩИТА%b\n\n' "$BOLD" "$NC"
         printf '  1) Настроить/переустановить firewall\n'
         printf '  2) Обновить списки сейчас\n'
@@ -488,7 +499,10 @@ guard_menu() {
 }
 
 crowdsec_installed() {
-    command -v cscli >/dev/null 2>&1 && dpkg-query -W -f='${Status}' crowdsec 2>/dev/null | grep -q 'ok installed'
+    local status
+    command -v cscli >/dev/null 2>&1 || return 1
+    status=$(dpkg-query -W -f='${Status}' crowdsec 2>/dev/null || true)
+    [[ $status == *"ok installed"* ]]
 }
 
 write_crowdsec_limits() {
@@ -511,88 +525,80 @@ MemoryHigh=${high_mb}M
 MemoryMax=${max_mb}M
 OOMScoreAdjust=-500
 EOF
-    cat > /etc/systemd/system/crowdsec-firewall-bouncer.service.d/server-tool.conf <<EOF
+    cat > /etc/systemd/system/crowdsec-firewall-bouncer.service.d/server-tool.conf <<'EOF'
 [Service]
 MemoryHigh=96M
 MemoryMax=160M
 OOMScoreAdjust=-400
-ExecStartPost=${CROWDSEC_FORWARD}
 EOF
-}
-
-write_crowdsec_forward_helper() {
-    cat > "$CROWDSEC_FORWARD" <<'CROWDSEC_FORWARD_SCRIPT'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-for _ in {1..20}; do
-    nft list table ip crowdsec >/dev/null 2>&1 && break
-    sleep 1
-done
-nft list table ip crowdsec >/dev/null 2>&1 || exit 0
-set_name=$(nft list table ip crowdsec | awk '$1 == "set" {print $2; exit}')
-[[ -n $set_name ]] || exit 0
-if ! nft list chain ip crowdsec crowdsec-forward >/dev/null 2>&1; then
-    nft add chain ip crowdsec crowdsec-forward '{ type filter hook forward priority -10; policy accept; }'
-fi
-if ! nft list chain ip crowdsec crowdsec-forward | grep -Fq "@$set_name"; then
-    nft add rule ip crowdsec crowdsec-forward ip saddr "@$set_name" counter drop
-fi
-CROWDSEC_FORWARD_SCRIPT
-    chmod 750 "$CROWDSEC_FORWARD"
 }
 
 configure_crowdsec_acquisition() {
-    local nginx_container=""
     mkdir -p /etc/crowdsec/acquis.d
-    if command -v docker >/dev/null 2>&1; then
-        nginx_container=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(remnanode.*nginx|nginx.*|.*-nginx-.*)$' | head -n 1) || true
+
+    if ! command -v docker >/dev/null 2>&1; then
+        rm -f "$CROWDSEC_ACQUIS"
+        warn "Docker не найден. SSH будет защищён; Nginx можно подключить позже."
+        return 0
     fi
-    if [[ -n $nginx_container && $nginx_container =~ ^[a-zA-Z0-9_.-]+$ ]]; then
-        cat > "$CROWDSEC_ACQUIS" <<EOF
+
+    # На всех Remnawave-нодах используются фиксированные имена:
+    #   remnawave-nginx — Nginx
+    #   remnanode       — контейнер ноды
+    # Никакого поиска по шаблонам: проверяем точное имя контейнера через inspect.
+    if ! docker container inspect "$REMNAWAVE_NGINX_CONTAINER" >/dev/null 2>&1; then
+        rm -f "$CROWDSEC_ACQUIS"
+        warn "Контейнер ${REMNAWAVE_NGINX_CONTAINER} не найден. SSH будет защищён; Nginx можно подключить позже."
+        return 0
+    fi
+
+    cat > "$CROWDSEC_ACQUIS" <<EOF
 source: docker
 container_name:
-  - ${nginx_container}
+  - ${REMNAWAVE_NGINX_CONTAINER}
 labels:
   type: nginx
 EOF
-        success "Подключены Docker-логи Nginx: ${nginx_container}"
+
+    success "Подключены Docker-логи Nginx: ${REMNAWAVE_NGINX_CONTAINER}"
+
+    if docker container inspect "$REMNANODE_CONTAINER" >/dev/null 2>&1; then
+        info "Контейнер ноды найден: ${REMNANODE_CONTAINER}"
     else
-        rm -f "$CROWDSEC_ACQUIS"
-        warn "Nginx-контейнер Remnawave не найден. SSH будет защищён; Nginx можно подключить позже."
+        warn "Контейнер ноды ${REMNANODE_CONTAINER} не найден. Это не мешает подключению логов Nginx."
     fi
 }
 
-install_crowdsec() {
-    require_root
-    ensure_packages curl gpg ca-certificates apt-transport-https
-    local key_tmp collection candidate
-    crowdsec_installed && warn "CrowdSec уже установлен; пакет и конфигурация будут обновлены."
-    step "Подключение официального репозитория CrowdSec"
-    key_tmp=$(mktemp)
-    curl -fsSL https://packagecloud.io/crowdsec/crowdsec/gpgkey -o "$key_tmp"
-    mkdir -p /etc/apt/keyrings /etc/apt/preferences.d
-    gpg --batch --yes --dearmor -o /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg "$key_tmp"
-    rm -f "$key_tmp"
-    cat > /etc/apt/sources.list.d/crowdsec_crowdsec.list <<'EOF'
-deb [signed-by=/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg] https://packagecloud.io/crowdsec/crowdsec/any any main
-EOF
-    cat > /etc/apt/preferences.d/crowdsec <<'EOF'
-Package: *
-Pin: release o=packagecloud.io/crowdsec/crowdsec,a=any,n=any,c=main
-Pin-Priority: 1001
-EOF
-    apt-get update
-    candidate=$(apt-cache policy crowdsec | awk '/Candidate:/ {print $2; exit}')
-    [[ -n $candidate && $candidate != '(none)' ]] || { error "CrowdSec недоступен из официального репозитория."; return 1; }
-    DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec crowdsec-firewall-bouncer-nftables
-
-    cscli hub update
-    for collection in crowdsecurity/linux crowdsecurity/sshd crowdsecurity/nginx; do
-        cscli collections install "$collection" >/dev/null 2>&1 || true
+wait_for_crowdsec_lapi() {
+    local attempt
+    for attempt in {1..20}; do
+        if cscli lapi status >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
     done
-    configure_crowdsec_acquisition
-    mkdir -p /etc/crowdsec/bouncers
-    cat > /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml.local <<'EOF'
+    error "CrowdSec LAPI не отвечает после запуска сервиса."
+    journalctl -u crowdsec -n 80 --no-pager || true
+    return 1
+}
+
+configure_crowdsec_bouncer() {
+    local api_key
+
+    # The package-generated key may become stale after reinstalling or resetting
+    # CrowdSec's local database. Recreate a deterministic local bouncer identity
+    # on every ServerTool run and place the matching key in the merged .local file.
+    cscli bouncers delete "$CROWDSEC_BOUNCER_NAME" --ignore-missing >/dev/null 2>&1 || true
+    api_key=$(cscli bouncers add "$CROWDSEC_BOUNCER_NAME" --output raw)
+    if [[ -z $api_key ]]; then
+        error "Не удалось создать API-ключ CrowdSec bouncer."
+        return 1
+    fi
+
+    install -d -o root -g root -m 0750 /etc/crowdsec/bouncers
+    cat > "$CROWDSEC_BOUNCER_LOCAL" <<EOF
+api_url: http://127.0.0.1:8080/
+api_key: "${api_key}"
 mode: nftables
 disable_ipv6: true
 nftables:
@@ -603,13 +609,81 @@ nftables:
     chain: crowdsec-chain
   ipv6:
     enabled: false
+nftables_hooks:
+  - input
+  - forward
 EOF
-    write_crowdsec_forward_helper
+    chmod 0640 "$CROWDSEC_BOUNCER_LOCAL"
+
+    if ! crowdsec-firewall-bouncer -c "$CROWDSEC_BOUNCER_CONFIG" -t >/dev/null; then
+        error "Конфигурация CrowdSec firewall bouncer не прошла проверку."
+        return 1
+    fi
+}
+
+install_crowdsec() {
+    require_root
+    ensure_packages curl gpg ca-certificates apt-transport-https
+    local key_tmp collection candidate policy
+    crowdsec_installed && warn "CrowdSec уже установлен; пакет и конфигурация будут обновлены."
+    step "Подключение официального репозитория CrowdSec"
+    key_tmp=$(mktemp)
+    curl -fsSL https://packagecloud.io/crowdsec/crowdsec/gpgkey -o "$key_tmp"
+    # APT verifies repository metadata as the unprivileged _apt user.
+    # The global umask is intentionally restrictive (027), so explicitly
+    # make the keyring directory traversable and the public key readable.
+    install -d -o root -g root -m 0755 /etc/apt/keyrings /etc/apt/preferences.d
+    gpg --batch --yes --dearmor -o /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg "$key_tmp"
+    chmod 0644 /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg
+    rm -f "$key_tmp"
+    cat > /etc/apt/sources.list.d/crowdsec_crowdsec.list <<'EOF'
+deb [signed-by=/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg] https://packagecloud.io/crowdsec/crowdsec/any any main
+EOF
+    cat > /etc/apt/preferences.d/crowdsec <<'EOF'
+Package: *
+Pin: release o=packagecloud.io/crowdsec/crowdsec,a=any,n=any,c=main
+Pin-Priority: 1001
+EOF
+    apt-get update
+    policy=$(apt-cache policy crowdsec)
+    candidate=$(awk '$1 == "Candidate:" {print $2; exit}' <<< "$policy")
+    [[ -n $candidate && $candidate != '(none)' ]] || { error "CrowdSec недоступен из официального репозитория."; return 1; }
+    DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec crowdsec-firewall-bouncer-nftables
+
+    cscli hub update
+    for collection in crowdsecurity/linux crowdsecurity/sshd crowdsecurity/nginx; do
+        cscli collections install "$collection" >/dev/null 2>&1 || true
+    done
+    configure_crowdsec_acquisition
+    # Versions <= 3.0.5 added a custom ExecStartPost helper. It duplicated
+    # the bouncer's native forward hook and could make systemd mark an
+    # otherwise working bouncer as failed. Remove all legacy remnants.
+    rm -f "$CROWDSEC_FORWARD"
+    nft delete chain ip crowdsec crowdsec-forward 2>/dev/null || true
     write_crowdsec_limits
     systemctl daemon-reload
     systemctl enable crowdsec crowdsec-firewall-bouncer >/dev/null
-    systemctl restart crowdsec
-    systemctl restart crowdsec-firewall-bouncer
+    # Stop a possibly looping bouncer before replacing its LAPI credentials.
+    systemctl stop crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+
+    if ! systemctl restart crowdsec; then
+        error "Не удалось запустить CrowdSec."
+        systemctl --no-pager --full status crowdsec || true
+        journalctl -u crowdsec -n 80 --no-pager || true
+        return 1
+    fi
+    wait_for_crowdsec_lapi || return 1
+    configure_crowdsec_bouncer || return 1
+
+    systemctl reset-failed crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+    if ! systemctl restart crowdsec-firewall-bouncer; then
+        error "Не удалось запустить CrowdSec firewall bouncer."
+        systemctl --no-pager --full status crowdsec-firewall-bouncer || true
+        journalctl -u crowdsec-firewall-bouncer -n 80 --no-pager || true
+        [[ -r /var/log/crowdsec-firewall-bouncer.log ]] && tail -n 80 /var/log/crowdsec-firewall-bouncer.log || true
+        return 1
+    fi
+
     sleep 1
     if systemctl is-active --quiet crowdsec && systemctl is-active --quiet crowdsec-firewall-bouncer; then
         success "CrowdSec и nftables-bouncer активны."
@@ -641,7 +715,7 @@ remove_crowdsec() {
 crowdsec_menu() {
     local choice
     while true; do
-        clear
+        clear 2>/dev/null || true
         printf '%b🕵️  CROWDSEC%b\n\n' "$BOLD" "$NC"
         if crowdsec_installed && systemctl is-active --quiet crowdsec; then
             success "CrowdSec активен"
@@ -740,7 +814,7 @@ random_free_port() {
     local port
     for _ in {1..100}; do
         port=$(shuf -i 20000-60999 -n 1)
-        ss -H -ltn "sport = :$port" 2>/dev/null | grep -q . || { printf '%s\n' "$port"; return; }
+        [[ -n $(ss -H -ltn "sport = :$port" 2>/dev/null) ]] || { printf '%s\n' "$port"; return; }
     done
     return 1
 }
@@ -769,7 +843,7 @@ configure_ssh() {
     read -r -p "Новый порт SSH [${new_port}]: " choice || true
     new_port=${choice:-$new_port}
     valid_port "$new_port" || { error "Некорректный порт."; return 1; }
-    ss -H -ltn "sport = :$new_port" 2>/dev/null | grep -q . && { error "Порт ${new_port} уже занят."; return 1; }
+    [[ -z $(ss -H -ltn "sport = :$new_port" 2>/dev/null) ]] || { error "Порт ${new_port} уже занят."; return 1; }
     disable_password=no
     has_key=no
     if authorized_key_exists "$user"; then
@@ -839,7 +913,7 @@ EOF
         return 1
     fi
     sleep 1
-    if ss -H -ltn "sport = :$new_port" | grep -q .; then
+    if [[ -n $(ss -H -ltn "sport = :$new_port" 2>/dev/null) ]]; then
         success "SSH слушает порт ${new_port}. Резервная копия: ${backup}"
         printf 'Проверка из нового окна: ssh -p %s %s@IP_СЕРВЕРА\n' "$new_port" "$user"
     else
@@ -852,7 +926,7 @@ EOF
 ssh_menu() {
     local choice
     while true; do
-        clear
+        clear 2>/dev/null || true
         printf '%b🔑 НАСТРОЙКА SSH%b\n\n' "$BOLD" "$NC"
         printf '  1) Вставить публичный ключ\n'
         printf '  2) Сгенерировать пару Ed25519\n'
@@ -872,10 +946,11 @@ ssh_menu() {
 }
 
 detect_psabi() {
-    local loader
+    local loader help_text
     for loader in /lib64/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2; do
         [[ -x $loader ]] || continue
-        "$loader" --help 2>/dev/null | grep -Eq 'x86-64-v3.*(supported|поддерж)' && { printf 'v3\n'; return; }
+        help_text=$("$loader" --help 2>/dev/null || true)
+        grep -Eq 'x86-64-v3.*(supported|поддерж)' <<< "$help_text" && { printf 'v3\n'; return; }
     done
     printf 'v2\n'
 }
@@ -905,11 +980,29 @@ install_xanmod() {
     confirm "Добавить официальный репозиторий и установить ${package}?" || return 0
     key_tmp=$(mktemp)
     wget -qO "$key_tmp" https://dl.xanmod.org/archive.key
-    mkdir -p /etc/apt/keyrings
+    install -d -m 0755 /etc/apt/keyrings
     gpg --batch --yes --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg "$key_tmp"
     rm -f "$key_tmp"
+
+    # ServerTool uses umask 027. APT downloads repository metadata as the
+    # unprivileged _apt user, so keyrings referenced by signed-by must remain
+    # world-readable. Otherwise APT reports NO_PUBKEY even when the right key
+    # was imported successfully.
+    chmod 0644 /etc/apt/keyrings/xanmod-archive-keyring.gpg
+
+    local xanmod_fingerprint
+    xanmod_fingerprint=$(gpg --batch --show-keys --with-colons \
+        /etc/apt/keyrings/xanmod-archive-keyring.gpg 2>/dev/null \
+        | awk -F: '$1 == "fpr" {print $10; exit}')
+    if [[ $xanmod_fingerprint != D38D7D1DA1349567ADED882D86F7D09EE734E623 ]]; then
+        rm -f /etc/apt/keyrings/xanmod-archive-keyring.gpg
+        error "Отпечаток ключа XanMod не совпал с официальным. Репозиторий не добавлен."
+        return 1
+    fi
+
     printf 'deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org %s main\n' "$codename" \
         > /etc/apt/sources.list.d/xanmod-release.list
+    chmod 0644 /etc/apt/sources.list.d/xanmod-release.list
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
     success "${package} установлен. Перезагрузитесь, когда будет удобно."
@@ -944,7 +1037,7 @@ EOF
 }
 
 show_status() {
-    clear
+    clear 2>/dev/null || true
     printf '%b📊 СОСТОЯНИЕ НОДЫ%b\n\n' "$BOLD" "$NC"
     printf 'ОС:          %s\n' "$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-unknown}")"
     printf 'Ядро:        %s\n' "$(uname -r)"
@@ -979,7 +1072,7 @@ full_setup() {
 
 show_help() {
     cat <<EOF
-${APP_NAME} ${VERSION} — настройка и защита Remnawave-ноды
+${APP_NAME} ${APP_VERSION} — настройка и защита Remnawave-ноды
 
 Использование:
   sudo bash server_tool.sh          интерактивное меню
@@ -992,9 +1085,9 @@ EOF
 show_menu() {
     local choice
     while true; do
-        clear
+        clear 2>/dev/null || true
         printf '%b╔══════════════════════════════════════════╗%b\n' "$CYAN" "$NC"
-        printf '%b║  🚀 ServerTool %-6s • Remnawave Node   ║%b\n' "$CYAN" "v${VERSION}" "$NC"
+        printf '%b║  🚀 ServerTool %-6s • Remnawave Node   ║%b\n' "$CYAN" "v${APP_VERSION}" "$NC"
         printf '%b╚══════════════════════════════════════════╝%b\n\n' "$CYAN" "$NC"
         printf '  1) 🧰 Полная рекомендуемая настройка\n'
         printf '  2) 🔄 Обновить систему\n'
@@ -1026,7 +1119,7 @@ show_menu() {
 main() {
     case "${1:-}" in
         -h|--help) show_help; return ;;
-        -v|--version) printf '%s %s\n' "$APP_NAME" "$VERSION"; return ;;
+        -v|--version) printf '%s %s\n' "$APP_NAME" "$APP_VERSION"; return ;;
         --status) require_root; require_supported_os; show_status; return ;;
         "") ;;
         *) show_help; return 2 ;;
@@ -1035,7 +1128,7 @@ main() {
     require_supported_os
     mkdir -p "$BACKUP_ROOT"
     touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
-    log INFO "ServerTool ${VERSION} started"
+    log INFO "ServerTool ${APP_VERSION} started"
     show_menu
 }
 
