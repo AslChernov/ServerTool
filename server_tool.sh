@@ -74,15 +74,18 @@ require_root() {
 }
 
 require_supported_os() {
-    local ID="" VERSION="" VERSION_ID="" PRETTY_NAME=""
+    local os_id
     [[ -r /etc/os-release ]] || die "Не удалось определить операционную систему."
-    # Load OS metadata into function-local variables so names such as VERSION
-    # cannot collide with ServerTool's own constants.
-    # shellcheck disable=SC1091
-    source /etc/os-release
-    case "${ID:-}" in
+    os_id=$(
+        # Load OS metadata in a subshell so names such as VERSION cannot
+        # collide with ServerTool's own constants or leak into application state.
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        printf '%s' "${ID:-}"
+    )
+    case "$os_id" in
         ubuntu|debian) ;;
-        *) die "Поддерживаются только Ubuntu и Debian (обнаружено: ${ID:-unknown})." ;;
+        *) die "Поддерживаются только Ubuntu и Debian (обнаружено: ${os_id:-unknown})." ;;
     esac
     [[ $(dpkg --print-architecture 2>/dev/null) == amd64 ]] || \
         warn "XanMod доступен только для amd64; остальные разделы продолжат работать."
@@ -599,7 +602,7 @@ wait_for_crowdsec_lapi() {
         fi
         sleep 1
     done
-    error "CrowdSec LAPI не отвечает после запуска сервиса."
+    error "CrowdSec LAPI не отвечает после ${attempt} попыток."
     journalctl -u crowdsec -n 80 --no-pager || true
     return 1
 }
