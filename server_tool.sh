@@ -525,12 +525,34 @@ MemoryHigh=${high_mb}M
 MemoryMax=${max_mb}M
 OOMScoreAdjust=-500
 EOF
-    cat > /etc/systemd/system/crowdsec-firewall-bouncer.service.d/server-tool.conf <<'EOF'
+    cat > /etc/systemd/system/crowdsec-firewall-bouncer.service.d/server-tool.conf <<EOF
 [Service]
 MemoryHigh=96M
 MemoryMax=160M
 OOMScoreAdjust=-400
+ExecStartPost=-${CROWDSEC_FORWARD}
 EOF
+}
+
+write_crowdsec_forward_helper() {
+    cat > "$CROWDSEC_FORWARD" <<'CROWDSEC_FORWARD_SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+for _ in {1..20}; do
+    nft list table ip crowdsec >/dev/null 2>&1 && break
+    sleep 1
+done
+nft list table ip crowdsec >/dev/null 2>&1 || exit 0
+set_name=$(nft list table ip crowdsec | awk '$1 == "set" {print $2; exit}')
+[[ -n $set_name ]] || exit 0
+if ! nft list chain ip crowdsec crowdsec-forward >/dev/null 2>&1; then
+    nft add chain ip crowdsec crowdsec-forward '{ type filter hook forward priority -10; policy accept; }'
+fi
+if ! nft list chain ip crowdsec crowdsec-forward | grep -Fq "@$set_name"; then
+    nft add rule ip crowdsec crowdsec-forward ip saddr "@$set_name" counter drop
+fi
+CROWDSEC_FORWARD_SCRIPT
+    chmod 0750 "$CROWDSEC_FORWARD"
 }
 
 configure_crowdsec_acquisition() {
@@ -609,9 +631,6 @@ nftables:
     chain: crowdsec-chain
   ipv6:
     enabled: false
-nftables_hooks:
-  - input
-  - forward
 EOF
     chmod 0640 "$CROWDSEC_BOUNCER_LOCAL"
 
@@ -655,10 +674,9 @@ EOF
         cscli collections install "$collection" >/dev/null 2>&1 || true
     done
     configure_crowdsec_acquisition
-    # Versions <= 3.0.5 added a custom ExecStartPost helper. It duplicated
-    # the bouncer's native forward hook and could make systemd mark an
-    # otherwise working bouncer as failed. Remove all legacy remnants.
-    rm -f "$CROWDSEC_FORWARD"
+    # The official nftables bouncer creates an input hook. Add a separate,
+    # idempotent forward hook so the same decisions also cover Docker DNAT.
+    write_crowdsec_forward_helper
     nft delete chain ip crowdsec crowdsec-forward 2>/dev/null || true
     write_crowdsec_limits
     systemctl daemon-reload
@@ -683,6 +701,10 @@ EOF
         [[ -r /var/log/crowdsec-firewall-bouncer.log ]] && tail -n 80 /var/log/crowdsec-firewall-bouncer.log || true
         return 1
     fi
+    if ! "$CROWDSEC_FORWARD"; then
+        error "CrowdSec запущен, но не удалось подключить блокировки к Docker forward."
+        return 1
+    fi
 
     sleep 1
     if systemctl is-active --quiet crowdsec && systemctl is-active --quiet crowdsec-firewall-bouncer; then
@@ -704,7 +726,8 @@ remove_crowdsec() {
     rm -f /etc/apt/sources.list.d/crowdsec_crowdsec.list \
         /etc/apt/preferences.d/crowdsec \
         /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg \
-        "$CROWDSEC_FORWARD" "$CROWDSEC_ACQUIS"
+        "$CROWDSEC_FORWARD" "$CROWDSEC_ACQUIS" \
+        "$CROWDSEC_BOUNCER_CONFIG" "$CROWDSEC_BOUNCER_LOCAL"
     rm -rf /etc/systemd/system/crowdsec.service.d /etc/systemd/system/crowdsec-firewall-bouncer.service.d
     nft delete table ip crowdsec 2>/dev/null || true
     nft delete table ip6 crowdsec6 2>/dev/null || true

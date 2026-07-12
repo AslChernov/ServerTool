@@ -58,6 +58,8 @@ jobs:
               )
           PY
           exit "$status"
+      - name: Smoke-test OS detection and status
+        run: sudo bash server_tool.sh --status
       - name: Validate generated nftables rules
         run: |
           sudo install -d -m 700 /etc/server-tool /var/lib/server-tool
