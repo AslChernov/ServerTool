@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly APP_VERSION="3.0.8"
+readonly APP_VERSION="3.0.9"
 readonly APP_NAME="ServerTool"
 readonly CONFIG_DIR="/etc/server-tool"
 readonly BACKUP_ROOT="/var/backups/server-tool"
@@ -858,9 +858,25 @@ restore_ssh_backup() {
     [[ ! -d "$backup/sshd_config.d" ]] || cp -a "$backup/sshd_config.d/." /etc/ssh/sshd_config.d/
 }
 
+ensure_sshd_runtime_dir() {
+    local runtime_dir=${1:-/run/sshd}
+    if [[ -L $runtime_dir || ( -e $runtime_dir && ! -d $runtime_dir ) ]]; then
+        error "${runtime_dir} существует, но не является безопасным каталогом."
+        return 1
+    fi
+    install -d -o root -g root -m 0755 "$runtime_dir"
+}
+
+show_effective_ssh_settings() {
+    ensure_sshd_runtime_dir || return 1
+    sshd -T 2>/dev/null \
+        | grep -E '^(port|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|maxauthtries) '
+}
+
 configure_ssh() {
     require_root
     ensure_packages openssh-server openssh-client iproute2
+    ensure_sshd_runtime_dir || return 1
     local old_port new_port user backup disable_password has_key choice file restart_ok firewall_config_changed
     old_port=$(detect_ssh_port)
     user=$(target_user_prompt) || { error "Пользователь не найден."; return 1; }
@@ -964,7 +980,7 @@ ssh_menu() {
             1) install_public_key; pause ;;
             2) generate_ssh_key; pause ;;
             3) configure_ssh; pause ;;
-            4) sshd -T 2>/dev/null | grep -E '^(port|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|maxauthtries) '; pause ;;
+            4) show_effective_ssh_settings; pause ;;
             0) return ;;
             *) warn "Неизвестный пункт."; sleep 1 ;;
         esac
@@ -1158,4 +1174,6 @@ main() {
     show_menu
 }
 
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi
