@@ -859,7 +859,7 @@ restore_ssh_backup() {
 }
 
 ensure_sshd_runtime_dir() {
-    local runtime_dir=${1:-/run/sshd}
+    local runtime_dir=$1
     if [[ -L $runtime_dir || ( -e $runtime_dir && ! -d $runtime_dir ) ]]; then
         error "${runtime_dir} существует, но не является безопасным каталогом."
         return 1
@@ -868,7 +868,7 @@ ensure_sshd_runtime_dir() {
 }
 
 show_effective_ssh_settings() {
-    ensure_sshd_runtime_dir || return 1
+    ensure_sshd_runtime_dir /run/sshd || return 1
     sshd -T 2>/dev/null \
         | grep -E '^(port|permitrootlogin|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|maxauthtries) '
 }
@@ -876,7 +876,7 @@ show_effective_ssh_settings() {
 configure_ssh() {
     require_root
     ensure_packages openssh-server openssh-client iproute2
-    ensure_sshd_runtime_dir || return 1
+    ensure_sshd_runtime_dir /run/sshd || return 1
     local old_port new_port user backup disable_password has_key choice file restart_ok firewall_config_changed
     old_port=$(detect_ssh_port)
     user=$(target_user_prompt) || { error "Пользователь не найден."; return 1; }
