@@ -5,8 +5,10 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly APP_VERSION="3.0.9"
+readonly APP_VERSION="3.0.10"
 readonly APP_NAME="ServerTool"
+readonly APT_LOCK_TIMEOUT=300
+readonly APT_LOCK_RETRY_DELAY=5
 readonly CONFIG_DIR="/etc/server-tool"
 readonly BACKUP_ROOT="/var/backups/server-tool"
 readonly LOG_FILE="/var/log/server-tool.log"
@@ -104,6 +106,43 @@ except ValueError:
 PY
 }
 
+run_apt() {
+    local output_file status deadline remaining delay
+    local -a pipe_status
+    output_file=$(mktemp /tmp/server-tool-apt.XXXXXX)
+    deadline=$((SECONDS + APT_LOCK_TIMEOUT))
+
+    while true; do
+        : > "$output_file"
+        if LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get "$@" 2>&1 | tee "$output_file"; then
+            rm -f "$output_file"
+            return 0
+        else
+            pipe_status=("${PIPESTATUS[@]}")
+            status=${pipe_status[0]}
+            ((status != 0)) || status=${pipe_status[1]:-1}
+        fi
+
+        if ((status != 100)) || ! grep -Eqi \
+            'could not get lock|unable to acquire.*lock|unable to lock directory' "$output_file"; then
+            rm -f "$output_file"
+            return "$status"
+        fi
+
+        remaining=$((deadline - SECONDS))
+        if ((remaining <= 0)); then
+            rm -f "$output_file"
+            error "APT остаётся занят другим процессом более ${APT_LOCK_TIMEOUT} секунд. Повторите операцию позже."
+            return "$status"
+        fi
+
+        delay=$APT_LOCK_RETRY_DELAY
+        ((delay <= remaining)) || delay=$remaining
+        warn "APT занят другим процессом. Повтор через ${delay} с (ожидание до ${remaining} с)..."
+        sleep "$delay"
+    done
+}
+
 ensure_packages() {
     local missing=() package status
     for package in "$@"; do
@@ -112,8 +151,8 @@ ensure_packages() {
     done
     if ((${#missing[@]})); then
         step "Установка пакетов: ${missing[*]}"
-        apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+        run_apt update
+        run_apt install -y --no-install-recommends "${missing[@]}"
     fi
 }
 
@@ -139,10 +178,10 @@ detect_ssh_port() {
 system_update() {
     require_root
     step "Обновление системы"
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
-    DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
-    apt-get autoclean
+    run_apt update
+    run_apt full-upgrade -y
+    run_apt autoremove -y
+    run_apt autoclean
     success "Система обновлена."
     [[ ! -f /var/run/reboot-required ]] || warn "Для завершения обновления нужна перезагрузка."
     log INFO "system update completed"
@@ -193,7 +232,7 @@ configure_firewall() {
     if command -v ufw >/dev/null 2>&1; then
         ufw --force disable >/dev/null 2>&1 || true
         systemctl disable --now ufw.service >/dev/null 2>&1 || true
-        DEBIAN_FRONTEND=noninteractive apt-get purge -y ufw >/dev/null || warn "UFW отключён, но пакет не удалось удалить."
+        run_apt purge -y ufw >/dev/null || warn "UFW отключён, но пакет не удалось удалить."
         "$GUARD_UPDATER" --apply
     fi
 
@@ -666,11 +705,11 @@ Package: *
 Pin: release o=packagecloud.io/crowdsec/crowdsec,a=any,n=any,c=main
 Pin-Priority: 1001
 EOF
-    apt-get update
+    run_apt update
     policy=$(apt-cache policy crowdsec)
     candidate=$(awk '$1 == "Candidate:" {print $2; exit}' <<< "$policy")
     [[ -n $candidate && $candidate != '(none)' ]] || { error "CrowdSec недоступен из официального репозитория."; return 1; }
-    DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec crowdsec-firewall-bouncer-nftables
+    run_apt install -y crowdsec crowdsec-firewall-bouncer-nftables
 
     cscli hub update
     for collection in crowdsecurity/linux crowdsecurity/sshd crowdsecurity/nginx; do
@@ -725,7 +764,7 @@ remove_crowdsec() {
     warn "Будут удалены CrowdSec, bouncer и их nftables-таблицы. Основной ServerTool firewall сохранится."
     confirm "Удалить CrowdSec?" || return 0
     systemctl disable --now crowdsec-firewall-bouncer crowdsec >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get purge -y crowdsec-firewall-bouncer-nftables crowdsec
+    run_apt purge -y crowdsec-firewall-bouncer-nftables crowdsec
     rm -f /etc/apt/sources.list.d/crowdsec_crowdsec.list \
         /etc/apt/preferences.d/crowdsec \
         /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg \
@@ -1045,8 +1084,8 @@ install_xanmod() {
     printf 'deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org %s main\n' "$codename" \
         > /etc/apt/sources.list.d/xanmod-release.list
     chmod 0644 /etc/apt/sources.list.d/xanmod-release.list
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
+    run_apt update
+    run_apt install -y "$package"
     success "${package} установлен. Перезагрузитесь, когда будет удобно."
     printf 'Текущее ядро: %s\n' "$(uname -r)"
     log INFO "xanmod installed package=${package}"
@@ -1129,7 +1168,7 @@ show_menu() {
     while true; do
         clear 2>/dev/null || true
         printf '%b╔══════════════════════════════════════════╗%b\n' "$CYAN" "$NC"
-        printf '%b║  🚀 ServerTool %-6s • Remnawave Node   ║%b\n' "$CYAN" "v${APP_VERSION}" "$NC"
+        printf '%b║  🚀 ServerTool %-7s • Remnawave Node  ║%b\n' "$CYAN" "v${APP_VERSION}" "$NC"
         printf '%b╚══════════════════════════════════════════╝%b\n\n' "$CYAN" "$NC"
         printf '  1) 🧰 Полная рекомендуемая настройка\n'
         printf '  2) 🔄 Обновить систему\n'
