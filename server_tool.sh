@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly APP_VERSION="3.0.10"
+readonly APP_VERSION="3.0.11"
 readonly APP_NAME="ServerTool"
 readonly APT_LOCK_TIMEOUT=300
 readonly APT_LOCK_RETRY_DELAY=5
@@ -23,6 +23,10 @@ readonly CROWDSEC_FORWARD="/usr/local/sbin/server-tool-crowdsec-forward"
 readonly CROWDSEC_BOUNCER_CONFIG="/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
 readonly CROWDSEC_BOUNCER_LOCAL="${CROWDSEC_BOUNCER_CONFIG}.local"
 readonly CROWDSEC_BOUNCER_NAME="server-tool-firewall-bouncer"
+readonly CROWDSEC_CONFIG_LOCAL="/etc/crowdsec/config.yaml.local"
+readonly CROWDSEC_LAPI_CREDENTIALS_LOCAL="/etc/crowdsec/local_api_credentials.yaml.local"
+readonly CROWDSEC_LAPI_PORT_FILE="${CONFIG_DIR}/crowdsec-lapi-port"
+readonly CROWDSEC_MANAGED_MARKER="# Managed by ServerTool"
 readonly DEFAULT_PANEL_IP="45.148.62.18"
 readonly DEFAULT_NODE_PORT="2222"
 readonly REMNAWAVE_NGINX_CONTAINER="remnawave-nginx"
@@ -547,6 +551,94 @@ crowdsec_installed() {
     [[ $status == *"ok installed"* ]]
 }
 
+crowdsec_port_available() {
+    local port="$1"
+    python3 - "$port" <<'PY'
+import socket
+import sys
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    raise SystemExit(1)
+finally:
+    sock.close()
+PY
+}
+
+select_crowdsec_lapi_port() {
+    local preferred="${1:-}" port
+
+    if valid_port "$preferred" && crowdsec_port_available "$preferred"; then
+        printf '%s\n' "$preferred"
+        return 0
+    fi
+
+    for port in 8080 {18080..18089}; do
+        [[ $port == "$preferred" ]] && continue
+        if crowdsec_port_available "$port"; then
+            printf '%s\n' "$port"
+            return 0
+        fi
+    done
+
+    error "Не найден свободный loopback-порт для CrowdSec LAPI (проверены 8080 и 18080-18089)."
+    return 1
+}
+
+write_crowdsec_lapi_overrides() {
+    local port="$1"
+    local config_local="${2:-$CROWDSEC_CONFIG_LOCAL}"
+    local credentials_local="${3:-$CROWDSEC_LAPI_CREDENTIALS_LOCAL}"
+    local file
+
+    for file in "$config_local" "$credentials_local"; do
+        if [[ -s $file ]] && ! grep -Fqx "$CROWDSEC_MANAGED_MARKER" "$file"; then
+            error "Файл ${file} уже содержит пользовательские настройки. ServerTool не будет его перезаписывать."
+            return 1
+        fi
+    done
+
+    cat > "$config_local" <<EOF
+${CROWDSEC_MANAGED_MARKER}
+api:
+  server:
+    listen_uri: 127.0.0.1:${port}
+EOF
+    cat > "$credentials_local" <<EOF
+${CROWDSEC_MANAGED_MARKER}
+url: http://127.0.0.1:${port}/
+EOF
+    chmod 0640 "$config_local" "$credentials_local"
+}
+
+prepare_crowdsec_lapi() {
+    local preferred="" port owner
+
+    if [[ -r $CROWDSEC_LAPI_PORT_FILE ]]; then
+        read -r preferred < "$CROWDSEC_LAPI_PORT_FILE" || true
+        valid_port "$preferred" || preferred=""
+    fi
+
+    port=$(select_crowdsec_lapi_port "$preferred") || return 1
+    if [[ $port != 8080 ]]; then
+        if crowdsec_port_available 8080; then
+            info "CrowdSec LAPI продолжит использовать сохранённый порт 127.0.0.1:${port}." >&2
+        else
+            warn "127.0.0.1:8080 занят другим процессом; CrowdSec LAPI будет использовать 127.0.0.1:${port}." >&2
+            owner=$(ss -H -ltnp "sport = :8080" 2>/dev/null || true)
+            [[ -z $owner ]] || printf 'Владелец занятого порта: %s\n' "$owner" >&2
+        fi
+    fi
+
+    write_crowdsec_lapi_overrides "$port" || return 1
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' "$port" > "$CROWDSEC_LAPI_PORT_FILE"
+    chmod 0600 "$CROWDSEC_LAPI_PORT_FILE"
+    printf '%s\n' "$port"
+}
+
 write_crowdsec_limits() {
     local ram_mb high_mb max_mb go_limit
     ram_mb=$(awk '/MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
@@ -647,7 +739,7 @@ wait_for_crowdsec_lapi() {
 }
 
 configure_crowdsec_bouncer() {
-    local api_key
+    local lapi_port="$1" api_key
 
     # The package-generated key may become stale after reinstalling or resetting
     # CrowdSec's local database. Recreate a deterministic local bouncer identity
@@ -661,7 +753,8 @@ configure_crowdsec_bouncer() {
 
     install -d -o root -g root -m 0750 /etc/crowdsec/bouncers
     cat > "$CROWDSEC_BOUNCER_LOCAL" <<EOF
-api_url: http://127.0.0.1:8080/
+${CROWDSEC_MANAGED_MARKER}
+api_url: http://127.0.0.1:${lapi_port}/
 api_key: "${api_key}"
 mode: nftables
 disable_ipv6: true
@@ -684,8 +777,8 @@ EOF
 
 install_crowdsec() {
     require_root
-    ensure_packages curl gpg ca-certificates apt-transport-https
-    local key_tmp collection candidate policy
+    ensure_packages curl gpg ca-certificates apt-transport-https python3 iproute2
+    local key_tmp collection candidate policy lapi_port
     crowdsec_installed && warn "CrowdSec уже установлен; пакет и конфигурация будут обновлены."
     step "Подключение официального репозитория CrowdSec"
     key_tmp=$(mktemp)
@@ -711,6 +804,12 @@ EOF
     [[ -n $candidate && $candidate != '(none)' ]] || { error "CrowdSec недоступен из официального репозитория."; return 1; }
     run_apt install -y crowdsec crowdsec-firewall-bouncer-nftables
 
+    # Package installation can start CrowdSec immediately. Stop both units
+    # before probing the LAPI port so the service does not race our checks or
+    # remain in an auto-restart loop after a bind failure.
+    systemctl stop crowdsec-firewall-bouncer crowdsec >/dev/null 2>&1 || true
+    lapi_port=$(prepare_crowdsec_lapi) || return 1
+
     cscli hub update
     for collection in crowdsecurity/linux crowdsecurity/sshd crowdsecurity/nginx; do
         cscli collections install "$collection" >/dev/null 2>&1 || true
@@ -723,9 +822,12 @@ EOF
     write_crowdsec_limits
     systemctl daemon-reload
     systemctl enable crowdsec crowdsec-firewall-bouncer >/dev/null
-    # Stop a possibly looping bouncer before replacing its LAPI credentials.
-    systemctl stop crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+    if ! crowdsec -c /etc/crowdsec/config.yaml -t -error; then
+        error "Конфигурация CrowdSec не прошла проверку."
+        return 1
+    fi
 
+    systemctl reset-failed crowdsec >/dev/null 2>&1 || true
     if ! systemctl restart crowdsec; then
         error "Не удалось запустить CrowdSec."
         systemctl --no-pager --full status crowdsec || true
@@ -733,7 +835,7 @@ EOF
         return 1
     fi
     wait_for_crowdsec_lapi || return 1
-    configure_crowdsec_bouncer || return 1
+    configure_crowdsec_bouncer "$lapi_port" || return 1
 
     systemctl reset-failed crowdsec-firewall-bouncer >/dev/null 2>&1 || true
     if ! systemctl restart crowdsec-firewall-bouncer; then
@@ -750,14 +852,14 @@ EOF
 
     sleep 1
     if systemctl is-active --quiet crowdsec && systemctl is-active --quiet crowdsec-firewall-bouncer; then
-        success "CrowdSec и nftables-bouncer активны."
+        success "CrowdSec и nftables-bouncer активны (LAPI 127.0.0.1:${lapi_port})."
         cscli bouncers list || true
     else
         error "CrowdSec установлен, но один из сервисов не запустился."
         systemctl --no-pager --full status crowdsec crowdsec-firewall-bouncer || true
         return 1
     fi
-    log INFO "CrowdSec installed with nftables bouncer"
+    log INFO "CrowdSec installed with nftables bouncer lapi=127.0.0.1:${lapi_port}"
 }
 
 remove_crowdsec() {
@@ -770,6 +872,12 @@ remove_crowdsec() {
         /etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg \
         "$CROWDSEC_FORWARD" "$CROWDSEC_ACQUIS" \
         "$CROWDSEC_BOUNCER_CONFIG" "$CROWDSEC_BOUNCER_LOCAL"
+    for file in "$CROWDSEC_CONFIG_LOCAL" "$CROWDSEC_LAPI_CREDENTIALS_LOCAL"; do
+        if [[ -f $file ]] && grep -Fqx "$CROWDSEC_MANAGED_MARKER" "$file"; then
+            rm -f "$file"
+        fi
+    done
+    rm -f "$CROWDSEC_LAPI_PORT_FILE"
     rm -rf /etc/systemd/system/crowdsec.service.d /etc/systemd/system/crowdsec-firewall-bouncer.service.d
     nft delete table ip crowdsec 2>/dev/null || true
     nft delete table ip6 crowdsec6 2>/dev/null || true
