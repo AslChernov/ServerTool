@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly APP_VERSION="3.0.11"
+readonly APP_VERSION="3.0.12"
 readonly APP_NAME="ServerTool"
 readonly APT_LOCK_TIMEOUT=300
 readonly APT_LOCK_RETRY_DELAY=5
@@ -110,11 +110,88 @@ except ValueError:
 PY
 }
 
+log_package_failure() {
+    local command="$1" output_file="$2"
+    [[ $EUID -eq 0 ]] || return 0
+    {
+        printf '%s [ERROR] package command failed: %s\n' "$(date '+%F %T')" "$command"
+        sed 's/^/[PACKAGE] /' "$output_file"
+    } >> "$LOG_FILE" 2>/dev/null || true
+}
+
+report_dpkg_state() {
+    local packages
+    packages=$(dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' 2>/dev/null | \
+        awk '$2 ~ /^i/ && ($2 !~ /^ii/ || substr($2, 3, 1) == "R") {print $1 " [" $2 "]"}' || true)
+    if [[ -n $packages ]]; then
+        error "Незавершённые пакеты dpkg:"
+        while IFS= read -r package; do
+            printf '  - %s\n' "$package" >&2
+        done <<< "$packages"
+    fi
+}
+
+prepare_dpkg_recovery_context() {
+    local failed_output="$1" lapi_port crowdsec_failed=no
+
+    if grep -Eqi \
+        'dpkg: error processing package (crowdsec|crowdsec-firewall-bouncer)|installed (crowdsec|crowdsec-firewall-bouncer).*script.*error' \
+        "$failed_output"; then
+        crowdsec_failed=yes
+    elif sed -n '/^Errors were encountered while processing:/,$p' "$failed_output" | \
+        grep -Eqi '(^|[[:space:]/])(crowdsec|crowdsec-firewall-bouncer)([[:space:]:/]|$)'; then
+        crowdsec_failed=yes
+    fi
+
+    if [[ $crowdsec_failed == yes ]]; then
+        warn "Ошибка затрагивает CrowdSec. Останавливается restart-loop и проверяется порт LAPI."
+        systemctl stop crowdsec-firewall-bouncer crowdsec >/dev/null 2>&1 || true
+        if lapi_port=$(prepare_crowdsec_lapi); then
+            info "CrowdSec подготовлен к повторной настройке (LAPI 127.0.0.1:${lapi_port})."
+        else
+            warn "Не удалось автоматически подготовить CrowdSec; dpkg всё равно попробует завершить настройку."
+        fi
+    fi
+}
+
+recover_dpkg_state() {
+    local failed_output="$1" output_file status fix_status
+    local -a pipe_status
+    warn "dpkg не завершил настройку пакетов. Выполняется одна попытка штатного восстановления."
+    prepare_dpkg_recovery_context "$failed_output"
+
+    output_file=$(mktemp /tmp/server-tool-dpkg.XXXXXX)
+    if LC_ALL=C DEBIAN_FRONTEND=noninteractive dpkg --configure --pending 2>&1 | tee "$output_file"; then
+        status=0
+    else
+        pipe_status=("${PIPESTATUS[@]}")
+        status=${pipe_status[0]}
+        ((status != 0)) || status=${pipe_status[1]:-1}
+        log_package_failure "dpkg --configure --pending" "$output_file"
+        warn "dpkg --configure --pending не завершился успешно; APT попробует исправить зависимости."
+    fi
+    rm -f "$output_file"
+
+    if APT_DPKG_RECOVERY_ACTIVE=1 run_apt --fix-broken install -y; then
+        success "Состояние APT/dpkg восстановлено."
+        return 0
+    else
+        fix_status=$?
+    fi
+
+    error "Автоматическое восстановление APT/dpkg не удалось."
+    report_dpkg_state
+    return "$fix_status"
+}
+
 run_apt() {
-    local output_file status deadline remaining delay
+    local output_file status deadline remaining delay command
+    local recovery_attempted=0
     local -a pipe_status
     output_file=$(mktemp /tmp/server-tool-apt.XXXXXX)
     deadline=$((SECONDS + APT_LOCK_TIMEOUT))
+    printf -v command '%q ' apt-get "$@"
+    command=${command% }
 
     while true; do
         : > "$output_file"
@@ -127,23 +204,41 @@ run_apt() {
             ((status != 0)) || status=${pipe_status[1]:-1}
         fi
 
-        if ((status != 100)) || ! grep -Eqi \
+        if ((status == 100)) && grep -Eqi \
             'could not get lock|unable to acquire.*lock|unable to lock directory' "$output_file"; then
+            remaining=$((deadline - SECONDS))
+            if ((remaining <= 0)); then
+                log_package_failure "$command" "$output_file"
+                rm -f "$output_file"
+                error "APT остаётся занят другим процессом более ${APT_LOCK_TIMEOUT} секунд. Повторите операцию позже."
+                return "$status"
+            fi
+
+            delay=$APT_LOCK_RETRY_DELAY
+            ((delay <= remaining)) || delay=$remaining
+            warn "APT занят другим процессом. Повтор через ${delay} с (ожидание до ${remaining} с)..."
+            sleep "$delay"
+            continue
+        fi
+
+        log_package_failure "$command" "$output_file"
+        if ((status == 100 && recovery_attempted == 0)) && \
+            [[ ${APT_DPKG_RECOVERY_ACTIVE:-0} != 1 ]] && \
+            grep -Eqi 'sub-process .*dpkg.*returned an error code|dpkg: error processing package' "$output_file"; then
+            recovery_attempted=1
+            if recover_dpkg_state "$output_file"; then
+                warn "Повтор команды после восстановления: ${command}"
+                continue
+            fi
             rm -f "$output_file"
+            error "Команда ${command} завершилась с кодом ${status}. Полный вывод сохранён в ${LOG_FILE}."
             return "$status"
         fi
 
-        remaining=$((deadline - SECONDS))
-        if ((remaining <= 0)); then
-            rm -f "$output_file"
-            error "APT остаётся занят другим процессом более ${APT_LOCK_TIMEOUT} секунд. Повторите операцию позже."
-            return "$status"
-        fi
-
-        delay=$APT_LOCK_RETRY_DELAY
-        ((delay <= remaining)) || delay=$remaining
-        warn "APT занят другим процессом. Повтор через ${delay} с (ожидание до ${remaining} с)..."
-        sleep "$delay"
+        rm -f "$output_file"
+        error "Команда ${command} завершилась с кодом ${status}. Полный вывод сохранён в ${LOG_FILE}."
+        [[ $status != 100 ]] || report_dpkg_state
+        return "$status"
     done
 }
 
