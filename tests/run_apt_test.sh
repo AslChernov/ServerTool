@@ -15,6 +15,8 @@ trap 'rm -rf "$work"' EXIT
 export APT_TEST_COUNT_FILE="${work}/count"
 export DPKG_TEST_COUNT_FILE="${work}/dpkg-count"
 export CROWDSEC_PREP_COUNT_FILE="${work}/crowdsec-prep-count"
+export CROWDSEC_SYNC_COUNT_FILE="${work}/crowdsec-sync-count"
+export CROWDSEC_WAIT_COUNT_FILE="${work}/crowdsec-wait-count"
 APT_TEST_MODE=
 
 fail() {
@@ -26,6 +28,8 @@ reset_calls() {
     printf '0\n' > "$APT_TEST_COUNT_FILE"
     printf '0\n' > "$DPKG_TEST_COUNT_FILE"
     printf '0\n' > "$CROWDSEC_PREP_COUNT_FILE"
+    printf '0\n' > "$CROWDSEC_SYNC_COUNT_FILE"
+    printf '0\n' > "$CROWDSEC_WAIT_COUNT_FILE"
 }
 
 call_count() {
@@ -93,6 +97,18 @@ dpkg() {
 
 systemctl() { :; }
 
+sync_crowdsec_bouncer_lapi_url() {
+    local count
+    read -r count < "$CROWDSEC_SYNC_COUNT_FILE"
+    printf '%s\n' "$((count + 1))" > "$CROWDSEC_SYNC_COUNT_FILE"
+}
+
+wait_for_crowdsec_lapi() {
+    local count
+    read -r count < "$CROWDSEC_WAIT_COUNT_FILE"
+    printf '%s\n' "$((count + 1))" > "$CROWDSEC_WAIT_COUNT_FILE"
+}
+
 prepare_crowdsec_lapi() {
     local count
     read -r count < "$CROWDSEC_PREP_COUNT_FILE"
@@ -150,6 +166,10 @@ reset_calls
 run_apt full-upgrade -y >/dev/null 2>&1 || fail 'CrowdSec dpkg error was not repaired'
 read -r crowdsec_prep_count < "$CROWDSEC_PREP_COUNT_FILE"
 [[ $crowdsec_prep_count == 1 ]] || fail 'CrowdSec recovery context was not prepared exactly once'
+read -r crowdsec_sync_count < "$CROWDSEC_SYNC_COUNT_FILE"
+[[ $crowdsec_sync_count == 1 ]] || fail 'CrowdSec bouncer URL was not synchronized exactly once'
+read -r crowdsec_wait_count < "$CROWDSEC_WAIT_COUNT_FILE"
+[[ $crowdsec_wait_count == 1 ]] || fail 'CrowdSec LAPI readiness was not checked exactly once'
 
 APT_TEST_MODE=persistent_dpkg_error
 reset_calls

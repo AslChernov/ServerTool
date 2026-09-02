@@ -72,4 +72,46 @@ fi
 grep -Fqx '    listen_uri: 127.0.0.1:19000' "$custom_config" || fail 'custom config changed'
 [[ ! -e $custom_credentials ]] || fail 'credentials were written after custom-config rejection'
 
+fresh_bouncer="${work}/fresh-bouncer.yaml.local"
+sync_crowdsec_bouncer_lapi_url 18080 "$fresh_bouncer"
+grep -Fqx "$CROWDSEC_MANAGED_MARKER" "$fresh_bouncer" || fail 'fresh bouncer marker is missing'
+grep -Fqx 'api_url: http://127.0.0.1:18080/' "$fresh_bouncer" || fail 'fresh bouncer URL is wrong'
+
+managed_bouncer="${work}/managed-bouncer.yaml.local"
+cat > "$managed_bouncer" <<EOF
+${CROWDSEC_MANAGED_MARKER}
+api_url: http://127.0.0.1:8080/
+api_key: "managed-secret"
+EOF
+sync_crowdsec_bouncer_lapi_url 18080 "$managed_bouncer"
+grep -Fqx 'api_url: http://127.0.0.1:18080/' "$managed_bouncer" || fail 'managed bouncer URL was not updated'
+grep -Fqx 'api_key: "managed-secret"' "$managed_bouncer" || fail 'managed bouncer API key changed'
+
+legacy_bouncer="${work}/legacy-bouncer.yaml.local"
+cat > "$legacy_bouncer" <<'EOF'
+api_url: http://127.0.0.1:8080/
+api_key: "legacy-secret"
+mode: nftables
+disable_ipv6: true
+nftables:
+  ipv4:
+    enabled: true
+    set-only: false
+    table: crowdsec
+    chain: crowdsec-chain
+  ipv6:
+    enabled: false
+EOF
+sync_crowdsec_bouncer_lapi_url 18080 "$legacy_bouncer"
+grep -Fqx "$CROWDSEC_MANAGED_MARKER" "$legacy_bouncer" || fail 'legacy bouncer was not adopted as managed'
+grep -Fqx 'api_url: http://127.0.0.1:18080/' "$legacy_bouncer" || fail 'legacy bouncer URL was not updated'
+grep -Fqx 'api_key: "legacy-secret"' "$legacy_bouncer" || fail 'legacy bouncer API key changed'
+
+custom_bouncer="${work}/custom-bouncer.yaml.local"
+printf 'api_url: http://127.0.0.1:19000/\ncustom_option: true\n' > "$custom_bouncer"
+if sync_crowdsec_bouncer_lapi_url 18080 "$custom_bouncer" >/dev/null 2>&1; then
+    fail 'custom bouncer override was overwritten'
+fi
+grep -Fqx 'api_url: http://127.0.0.1:19000/' "$custom_bouncer" || fail 'custom bouncer URL changed'
+
 printf 'PASS: CrowdSec LAPI port and override behavior\n'

@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly APP_VERSION="3.0.12"
+readonly APP_VERSION="3.0.13"
 readonly APP_NAME="ServerTool"
 readonly APT_LOCK_TIMEOUT=300
 readonly APT_LOCK_RETRY_DELAY=5
@@ -147,7 +147,26 @@ prepare_dpkg_recovery_context() {
         warn "Ошибка затрагивает CrowdSec. Останавливается restart-loop и проверяется порт LAPI."
         systemctl stop crowdsec-firewall-bouncer crowdsec >/dev/null 2>&1 || true
         if lapi_port=$(prepare_crowdsec_lapi); then
-            info "CrowdSec подготовлен к повторной настройке (LAPI 127.0.0.1:${lapi_port})."
+            if sync_crowdsec_bouncer_lapi_url "$lapi_port"; then
+                info "URL bouncer синхронизирован с LAPI 127.0.0.1:${lapi_port}."
+            else
+                warn "LAPI подготовлен, но пользовательский bouncer-оверлей требует ручной проверки."
+            fi
+            systemctl reset-failed crowdsec >/dev/null 2>&1 || true
+            if systemctl restart crowdsec && wait_for_crowdsec_lapi; then
+                info "CrowdSec LAPI запущен; проверяется запуск bouncer до повторного dpkg."
+                systemctl reset-failed crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+                if systemctl start crowdsec-firewall-bouncer; then
+                    info "CrowdSec firewall bouncer успешно подключился к LAPI."
+                else
+                    warn "Bouncer пока не запустился; ниже приведена диагностика перед повторным dpkg."
+                    systemctl --no-pager --full status crowdsec-firewall-bouncer 2>/dev/null || true
+                    journalctl -u crowdsec-firewall-bouncer -n 80 --no-pager 2>/dev/null || true
+                fi
+            else
+                warn "CrowdSec LAPI пока не запустился; dpkg попробует завершить настройку зависимостей."
+                systemctl --no-pager --full status crowdsec 2>/dev/null || true
+            fi
         else
             warn "Не удалось автоматически подготовить CrowdSec; dpkg всё равно попробует завершить настройку."
         fi
@@ -706,6 +725,51 @@ ${CROWDSEC_MANAGED_MARKER}
 url: http://127.0.0.1:${port}/
 EOF
     chmod 0640 "$config_local" "$credentials_local"
+}
+
+is_legacy_server_tool_bouncer_override() {
+    local bouncer_local="$1"
+    grep -Eq '^api_url: http://127\.0\.0\.1:[0-9]+/$' "$bouncer_local" &&
+        grep -Eq '^api_key: "?[^[:space:]"]+"?[[:space:]]*$' "$bouncer_local" &&
+        grep -Fqx 'mode: nftables' "$bouncer_local" &&
+        grep -Fqx 'disable_ipv6: true' "$bouncer_local" &&
+        grep -Fqx '    table: crowdsec' "$bouncer_local" &&
+        grep -Fqx '    chain: crowdsec-chain' "$bouncer_local"
+}
+
+sync_crowdsec_bouncer_lapi_url() {
+    local port="$1" bouncer_local="${2:-$CROWDSEC_BOUNCER_LOCAL}"
+    local api_url="http://127.0.0.1:${port}/"
+
+    if [[ ! -s $bouncer_local ]]; then
+        cat > "$bouncer_local" <<EOF
+${CROWDSEC_MANAGED_MARKER}
+api_url: ${api_url}
+EOF
+        chmod 0640 "$bouncer_local"
+        return 0
+    fi
+
+    # A custom file that already points at the selected LAPI needs no changes.
+    grep -Fqx "api_url: ${api_url}" "$bouncer_local" && return 0
+
+    if grep -Fqx "$CROWDSEC_MANAGED_MARKER" "$bouncer_local"; then
+        if grep -Eq '^api_url:' "$bouncer_local"; then
+            sed -Ei "s#^api_url:.*#api_url: ${api_url}#" "$bouncer_local"
+        else
+            printf 'api_url: %s\n' "$api_url" >> "$bouncer_local"
+        fi
+    elif is_legacy_server_tool_bouncer_override "$bouncer_local"; then
+        # Versions <=3.0.10 created this exact structure without a marker.
+        # Preserve its API key and nftables settings, and adopt it as managed.
+        sed -Ei "s#^api_url:.*#api_url: ${api_url}#" "$bouncer_local"
+        sed -i "1i${CROWDSEC_MANAGED_MARKER}" "$bouncer_local"
+    else
+        error "Файл ${bouncer_local} содержит пользовательские настройки. ServerTool не будет менять api_url."
+        return 1
+    fi
+
+    chmod 0640 "$bouncer_local"
 }
 
 prepare_crowdsec_lapi() {
