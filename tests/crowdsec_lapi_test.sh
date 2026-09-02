@@ -114,4 +114,11 @@ if sync_crowdsec_bouncer_lapi_url 18080 "$custom_bouncer" >/dev/null 2>&1; then
 fi
 grep -Fqx 'api_url: http://127.0.0.1:19000/' "$custom_bouncer" || fail 'custom bouncer URL changed'
 
+generated_bouncer="${work}/generated-bouncer.yaml.local"
+write_crowdsec_bouncer_override 18080 'generated-secret' "$generated_bouncer"
+grep -Fqx 'api_url: http://127.0.0.1:18080/' "$generated_bouncer" || fail 'generated bouncer URL is wrong'
+grep -Fqx 'api_key: "generated-secret"' "$generated_bouncer" || fail 'generated bouncer API key is wrong'
+grep -A2 '^nftables_hooks:' "$generated_bouncer" | grep -Fqx '  - input' || fail 'generated bouncer input hook is missing'
+grep -A2 '^nftables_hooks:' "$generated_bouncer" | grep -Fqx '  - forward' || fail 'generated bouncer forward hook is missing'
+
 printf 'PASS: CrowdSec LAPI port and override behavior\n'

@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly APP_VERSION="3.0.13"
+readonly APP_VERSION="3.0.14"
 readonly APP_NAME="ServerTool"
 readonly APT_LOCK_TIMEOUT=300
 readonly APT_LOCK_RETRY_DELAY=5
@@ -823,29 +823,7 @@ EOF
 MemoryHigh=96M
 MemoryMax=160M
 OOMScoreAdjust=-400
-ExecStartPost=-${CROWDSEC_FORWARD}
 EOF
-}
-
-write_crowdsec_forward_helper() {
-    cat > "$CROWDSEC_FORWARD" <<'CROWDSEC_FORWARD_SCRIPT'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-for _ in {1..20}; do
-    nft list table ip crowdsec >/dev/null 2>&1 && break
-    sleep 1
-done
-nft list table ip crowdsec >/dev/null 2>&1 || exit 0
-set_name=$(nft list table ip crowdsec | awk '$1 == "set" {print $2; exit}')
-[[ -n $set_name ]] || exit 0
-if ! nft list chain ip crowdsec crowdsec-forward >/dev/null 2>&1; then
-    nft add chain ip crowdsec crowdsec-forward '{ type filter hook forward priority -10; policy accept; }'
-fi
-if ! nft list chain ip crowdsec crowdsec-forward | grep -Fq "@$set_name"; then
-    nft add rule ip crowdsec crowdsec-forward ip saddr "@$set_name" counter drop
-fi
-CROWDSEC_FORWARD_SCRIPT
-    chmod 0750 "$CROWDSEC_FORWARD"
 }
 
 configure_crowdsec_acquisition() {
@@ -897,6 +875,30 @@ wait_for_crowdsec_lapi() {
     return 1
 }
 
+write_crowdsec_bouncer_override() {
+    local lapi_port="$1" api_key="$2" bouncer_local="${3:-$CROWDSEC_BOUNCER_LOCAL}"
+
+    cat > "$bouncer_local" <<EOF
+${CROWDSEC_MANAGED_MARKER}
+api_url: http://127.0.0.1:${lapi_port}/
+api_key: "${api_key}"
+mode: nftables
+disable_ipv6: true
+nftables:
+  ipv4:
+    enabled: true
+    set-only: false
+    table: crowdsec
+    chain: crowdsec-chain
+  ipv6:
+    enabled: false
+nftables_hooks:
+  - input
+  - forward
+EOF
+    chmod 0640 "$bouncer_local"
+}
+
 configure_crowdsec_bouncer() {
     local lapi_port="$1" api_key
 
@@ -911,22 +913,7 @@ configure_crowdsec_bouncer() {
     fi
 
     install -d -o root -g root -m 0750 /etc/crowdsec/bouncers
-    cat > "$CROWDSEC_BOUNCER_LOCAL" <<EOF
-${CROWDSEC_MANAGED_MARKER}
-api_url: http://127.0.0.1:${lapi_port}/
-api_key: "${api_key}"
-mode: nftables
-disable_ipv6: true
-nftables:
-  ipv4:
-    enabled: true
-    set-only: false
-    table: crowdsec
-    chain: crowdsec-chain
-  ipv6:
-    enabled: false
-EOF
-    chmod 0640 "$CROWDSEC_BOUNCER_LOCAL"
+    write_crowdsec_bouncer_override "$lapi_port" "$api_key"
 
     if ! crowdsec-firewall-bouncer -c "$CROWDSEC_BOUNCER_CONFIG" -t >/dev/null; then
         error "Конфигурация CrowdSec firewall bouncer не прошла проверку."
@@ -974,9 +961,9 @@ EOF
         cscli collections install "$collection" >/dev/null 2>&1 || true
     done
     configure_crowdsec_acquisition
-    # The official nftables bouncer creates an input hook. Add a separate,
-    # idempotent forward hook so the same decisions also cover Docker DNAT.
-    write_crowdsec_forward_helper
+    # Versions <=3.0.13 created a separate forward hook. The current bouncer
+    # supports input and forward hooks natively, so remove the legacy helper.
+    rm -f "$CROWDSEC_FORWARD"
     nft delete chain ip crowdsec crowdsec-forward 2>/dev/null || true
     write_crowdsec_limits
     systemctl daemon-reload
@@ -1004,11 +991,6 @@ EOF
         [[ -r /var/log/crowdsec-firewall-bouncer.log ]] && tail -n 80 /var/log/crowdsec-firewall-bouncer.log || true
         return 1
     fi
-    if ! "$CROWDSEC_FORWARD"; then
-        error "CrowdSec запущен, но не удалось подключить блокировки к Docker forward."
-        return 1
-    fi
-
     sleep 1
     if systemctl is-active --quiet crowdsec && systemctl is-active --quiet crowdsec-firewall-bouncer; then
         success "CrowdSec и nftables-bouncer активны (LAPI 127.0.0.1:${lapi_port})."
