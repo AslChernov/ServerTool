@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly APP_VERSION="3.0.14"
+readonly APP_VERSION="3.1.0"
 readonly APP_NAME="ServerTool"
 readonly APT_LOCK_TIMEOUT=300
 readonly APT_LOCK_RETRY_DELAY=5
@@ -98,6 +98,46 @@ require_supported_os() {
 }
 
 valid_port() { [[ ${1:-} =~ ^[0-9]+$ ]] && ((1 <= 10#$1 && 10#$1 <= 65535)); }
+
+normalize_guard_ports() {
+    local raw="${1:-}" port result=""
+    local -a ports=()
+    [[ $raw =~ ^[0-9,[:space:]]*$ ]] || return 1
+    raw=${raw//,/ }
+    raw=${raw//$'\n'/ }
+    raw=${raw//$'\r'/ }
+    IFS=$' \t' read -r -a ports <<< "$raw"
+    for port in "${ports[@]}"; do
+        [[ ${#port} -le 5 ]] && valid_port "$port" || return 1
+        port=$((10#$port))
+        [[ " $result " != *" $port "* ]] || continue
+        result+="${result:+ }$port"
+    done
+    printf '%s\n' "$result"
+}
+
+validate_guard_extra_ports() {
+    local tcp_ports="$1" udp_ports="$2" node_port="$3" ssh_port="$4" port
+    local -a ports=()
+    IFS=' ' read -r -a ports <<< "$tcp_ports $udp_ports"
+    for port in "${ports[@]}"; do
+        if ((port == 443 || port == 10#$node_port || port == 10#$ssh_port)); then
+            echo "Порт ${port} управляется основными настройками SSH/API/443, а не дополнительными портами." >&2
+            return 1
+        fi
+    done
+}
+
+read_guard_extra_ports() (
+    local protocol="$1" EXTRA_TCP_PORTS="" EXTRA_UDP_PORTS=""
+    # shellcheck disable=SC1090
+    [[ ! -r $GUARD_CONFIG ]] || source "$GUARD_CONFIG"
+    case "$protocol" in
+        tcp) normalize_guard_ports "$EXTRA_TCP_PORTS" ;;
+        udp) normalize_guard_ports "$EXTRA_UDP_PORTS" ;;
+        *) return 1 ;;
+    esac
+)
 
 valid_ipv4_cidr() {
     python3 - "$1" <<'PY' >/dev/null 2>&1
@@ -343,7 +383,7 @@ configure_firewall() {
     cp -a /etc/ufw "$backup/" 2>/dev/null || true
     ufw status numbered > "$backup/ufw-status.txt" 2>&1 || true
 
-    write_guard_config "$ssh_port" "$node_port" "$panel_ip" "$https_mode"
+    write_guard_config "$ssh_port" "$node_port" "$panel_ip" "$https_mode" || return 1
     install_guard_runtime
 
     # The new firewall is already active. Now remove UFW without flushing unrelated nftables tables.
@@ -361,8 +401,12 @@ configure_firewall() {
 
 write_guard_config() {
     local ssh_port="$1" node_port="$2" panel_ip="$3" https_mode="$4" geo_countries=""
+    local tcp_ports udp_ports
+    tcp_ports=$(read_guard_extra_ports tcp) || { error "Некорректный список дополнительных TCP-портов."; return 1; }
+    udp_ports=$(read_guard_extra_ports udp) || { error "Некорректный список дополнительных UDP-портов."; return 1; }
+    validate_guard_extra_ports "$tcp_ports" "$udp_ports" "$node_port" "$ssh_port" || return 1
     if [[ -r $GUARD_CONFIG ]]; then
-        geo_countries=$(awk -F= '$1 == "GEO_COUNTRIES" {gsub(/\"/, "", $2); print $2; exit}' "$GUARD_CONFIG")
+        geo_countries=$(awk -F= '$1 == "GEO_COUNTRIES" {gsub(/"/, "", $2); print $2; exit}' "$GUARD_CONFIG")
     fi
     mkdir -p "$CONFIG_DIR"
     cat > "$GUARD_CONFIG" <<EOF
@@ -371,6 +415,9 @@ SSH_PORT="${ssh_port}"
 NODE_PORT="${node_port}"
 PANEL_IPV4="${panel_ip}"
 HTTPS_MODE="${https_mode}"
+# Additional public IPv4 ports. SSH, NODE_PORT and 443 are managed separately.
+EXTRA_TCP_PORTS="${tcp_ports}"
+EXTRA_UDP_PORTS="${udp_ports}"
 BLOCKLIST_URLS=(
   "https://cdn.jsdelivr.net/gh/shadow-netlab/traffic-guard-lists@main/public/antiscanner.list"
   "https://cdn.jsdelivr.net/gh/shadow-netlab/traffic-guard-lists@main/public/government_networks.list"
@@ -381,14 +428,16 @@ EOF
     chmod 600 "$GUARD_CONFIG"
 }
 
-install_guard_runtime() {
-    mkdir -p "$CONFIG_DIR"
-    [[ -f $GUARD_CONFIG ]] || write_guard_config "$(detect_ssh_port)" "$DEFAULT_NODE_PORT" "$DEFAULT_PANEL_IP" both
-    cat > "$GUARD_UPDATER" <<'GUARD_SCRIPT'
+write_guard_updater() {
+    local target="${1:-$GUARD_UPDATER}" config="${2:-$GUARD_CONFIG}"
+    cat > "$target" <<'GUARD_HEADER' || return 1
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-CONFIG=/etc/server-tool/guard.conf
+GUARD_HEADER
+    printf 'CONFIG=%q\n' "$config" >> "$target" || return 1
+    declare -f valid_port normalize_guard_ports validate_guard_extra_ports >> "$target" || return 1
+    cat >> "$target" <<'GUARD_SCRIPT'
 TABLE=server_tool_guard
 CACHE=/var/lib/server-tool/blocklist-v4.txt
 [[ -r $CONFIG ]] || { echo "Missing $CONFIG" >&2; exit 1; }
@@ -397,6 +446,9 @@ source "$CONFIG"
 [[ ${SSH_PORT:-} =~ ^[0-9]+$ ]] && ((SSH_PORT >= 1 && SSH_PORT <= 65535)) || exit 1
 [[ ${NODE_PORT:-} =~ ^[0-9]+$ ]] && ((NODE_PORT >= 1 && NODE_PORT <= 65535)) || exit 1
 [[ ${HTTPS_MODE:-} =~ ^(both|tcp|udp|none)$ ]] || exit 1
+EXTRA_TCP_PORTS=$(normalize_guard_ports "${EXTRA_TCP_PORTS:-}") || { echo 'Invalid EXTRA_TCP_PORTS' >&2; exit 1; }
+EXTRA_UDP_PORTS=$(normalize_guard_ports "${EXTRA_UDP_PORTS:-}") || { echo 'Invalid EXTRA_UDP_PORTS' >&2; exit 1; }
+validate_guard_extra_ports "$EXTRA_TCP_PORTS" "$EXTRA_UDP_PORTS" "$NODE_PORT" "$SSH_PORT" || exit 1
 python3 - "$PANEL_IPV4" <<'PY' >/dev/null
 import ipaddress, sys
 n = ipaddress.ip_network(sys.argv[1], strict=False)
@@ -487,6 +539,18 @@ EOF
     flags interval
     elements = { $PANEL_IPV4 }
   }
+  set extra_tcp_ports {
+    type inet_service
+EOF
+    [[ -z $EXTRA_TCP_PORTS ]] || printf '    elements = { %s }\n' "${EXTRA_TCP_PORTS// /, }"
+    cat <<EOF
+  }
+  set extra_udp_ports {
+    type inet_service
+EOF
+    [[ -z $EXTRA_UDP_PORTS ]] || printf '    elements = { %s }\n' "${EXTRA_UDP_PORTS// /, }"
+    cat <<EOF
+  }
   chain input {
     type filter hook input priority -20; policy drop;
     iifname "lo" counter accept
@@ -500,6 +564,8 @@ EOF
     meta nfproto ipv4 ip saddr @panel_v4 tcp dport $NODE_PORT counter accept
     meta nfproto ipv4 ip saddr @blocked_v4 counter drop
     meta nfproto ipv4 tcp dport $SSH_PORT counter accept
+    meta nfproto ipv4 tcp dport @extra_tcp_ports counter accept
+    meta nfproto ipv4 udp dport @extra_udp_ports counter accept
 EOF
     case "$HTTPS_MODE" in
         both) echo '    meta nfproto ipv4 tcp dport 443 counter accept'; echo '    meta nfproto ipv4 udp dport 443 counter accept' ;;
@@ -519,6 +585,8 @@ EOF
     iifname "br-*" counter accept
     meta l4proto tcp ct original proto-dst $NODE_PORT counter drop
     tcp dport $NODE_PORT counter drop
+    meta nfproto ipv4 meta l4proto tcp ct original proto-dst @extra_tcp_ports counter accept
+    meta nfproto ipv4 meta l4proto udp ct original proto-dst @extra_udp_ports counter accept
 EOF
     case "$HTTPS_MODE" in
         both) echo '    meta l4proto tcp ct original proto-dst 443 counter accept'; echo '    meta l4proto udp ct original proto-dst 443 counter accept' ;;
@@ -539,6 +607,12 @@ fi
 nft --file "$work/rules.nft"
 echo "Applied nftables firewall with $count blocked IPv4 networks"
 GUARD_SCRIPT
+}
+
+install_guard_runtime() {
+    mkdir -p "$CONFIG_DIR"
+    [[ -f $GUARD_CONFIG ]] || write_guard_config "$(detect_ssh_port)" "$DEFAULT_NODE_PORT" "$DEFAULT_PANEL_IP" both || return 1
+    write_guard_updater || return 1
     chmod 750 "$GUARD_UPDATER"
     cat > "$GUARD_SERVICE" <<EOF
 [Unit]
@@ -593,6 +667,116 @@ EOF
     fi
 }
 
+edit_guard_port_list() {
+    local list="$1" action="$2" port="$3" item result=""
+    local -a ports=()
+    case "$action" in
+        add) normalize_guard_ports "$list $port" ;;
+        remove)
+            IFS=' ' read -r -a ports <<< "$list"
+            for item in "${ports[@]}"; do
+                [[ $item == "$port" ]] || result+="${result:+ }$item"
+            done
+            printf '%s\n' "$result"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+change_guard_port() (
+    local action="$1" protocol="$2" port="$3" backup
+    local EXTRA_TCP_PORTS="" EXTRA_UDP_PORTS="" SSH_PORT="" NODE_PORT=""
+    require_root
+    [[ $action == add || $action == remove ]] || return 1
+    [[ $protocol == tcp || $protocol == udp || $protocol == both ]] || return 1
+    [[ $port =~ ^[0-9]{1,5}$ ]] && valid_port "$port" || { error "Некорректный порт (1–65535)."; return 1; }
+    port=$((10#$port))
+    [[ -f $GUARD_CONFIG && ! -L $GUARD_CONFIG && -f $GUARD_UPDATER && ! -L $GUARD_UPDATER ]] || {
+        error "Сначала настройте основной firewall через пункт 3 главного меню."; return 1;
+    }
+    # shellcheck disable=SC1090
+    source "$GUARD_CONFIG"
+    valid_port "$SSH_PORT" && valid_port "$NODE_PORT" || { error "Некорректные основные порты в guard.conf."; return 1; }
+    validate_guard_extra_ports "$port" "" "$NODE_PORT" "$SSH_PORT" || return 1
+    EXTRA_TCP_PORTS=$(normalize_guard_ports "$EXTRA_TCP_PORTS") || return 1
+    EXTRA_UDP_PORTS=$(normalize_guard_ports "$EXTRA_UDP_PORTS") || return 1
+    if [[ $protocol == tcp || $protocol == both ]]; then
+        EXTRA_TCP_PORTS=$(edit_guard_port_list "$EXTRA_TCP_PORTS" "$action" "$port") || return 1
+    fi
+    if [[ $protocol == udp || $protocol == both ]]; then
+        EXTRA_UDP_PORTS=$(edit_guard_port_list "$EXTRA_UDP_PORTS" "$action" "$port") || return 1
+    fi
+    validate_guard_extra_ports "$EXTRA_TCP_PORTS" "$EXTRA_UDP_PORTS" "$NODE_PORT" "$SSH_PORT" || return 1
+
+    mkdir -p "$BACKUP_ROOT" || return 1
+    backup=$(mktemp -d "${BACKUP_ROOT}/ports.XXXXXX") || return 1
+    cp -p "$GUARD_CONFIG" "$backup/guard.conf" || return 1
+    cp -p "$GUARD_UPDATER" "$backup/updater" || return 1
+    awk '!/^[[:space:]]*(EXTRA_TCP_PORTS|EXTRA_UDP_PORTS)=/' "$GUARD_CONFIG" > "$backup/new-guard.conf" || return 1
+    printf '\nEXTRA_TCP_PORTS="%s"\nEXTRA_UDP_PORTS="%s"\n' "$EXTRA_TCP_PORTS" "$EXTRA_UDP_PORTS" >> "$backup/new-guard.conf" || return 1
+    # Check the prospective config without changing the installed config or rules.
+    write_guard_updater "$backup/check-updater" "$backup/new-guard.conf" || return 1
+    write_guard_updater "$backup/new-updater" || return 1
+    if ! bash -n "$backup/new-updater" || ! bash "$backup/check-updater" --check; then
+        error "Проверка не пройдена; настройки и правила не изменены. Копия: $backup"
+        return 1
+    fi
+    if install -m 600 "$backup/new-guard.conf" "$GUARD_CONFIG" &&
+        install -m 750 "$backup/new-updater" "$GUARD_UPDATER" &&
+        bash "$GUARD_UPDATER" --apply; then
+        success "Дополнительные порты сохранены и применены. Копия: $backup"
+        log INFO "extra port ${action} port=${port} protocol=${protocol}"
+    else
+        if install -m 600 "$backup/guard.conf" "$GUARD_CONFIG" &&
+            install -m 750 "$backup/updater" "$GUARD_UPDATER" &&
+            bash "$GUARD_UPDATER" --apply; then
+            error "Применение не удалось; прежние настройки восстановлены. Копия: $backup"
+        else
+            error "Не удалось полностью восстановить firewall. Не закрывайте SSH; резервная копия: $backup"
+        fi
+        return 1
+    fi
+)
+
+guard_ports_menu() {
+    require_root
+    local choice port protocol action tcp_ports udp_ports verb
+    [[ -r $GUARD_CONFIG && -f $GUARD_UPDATER ]] || {
+        error "Сначала настройте основной firewall через пункт 3 главного меню."; pause; return;
+    }
+    while true; do
+        tcp_ports=$(read_guard_extra_ports tcp) || { error "Некорректный EXTRA_TCP_PORTS."; return 1; }
+        udp_ports=$(read_guard_extra_ports udp) || { error "Некорректный EXTRA_UDP_PORTS."; return 1; }
+        printf '\n%bДОПОЛНИТЕЛЬНЫЕ ПОРТЫ%b\n' "$BOLD" "$NC"
+        printf '  TCP: %s\n  UDP: %s\n' "${tcp_ports:-нет}" "${udp_ports:-нет}"
+        printf '\n  1) Открыть свой порт\n  2) Убрать дополнительное разрешение\n  0) Назад\n\n'
+        read -r -p "Выбор: " choice || return 0
+        case "$choice" in
+            0) return ;;
+            1) action=add; verb="Открыть" ;;
+            2) action=remove; verb="Убрать разрешение для" ;;
+            *) warn "Введите 0, 1 или 2."; continue ;;
+        esac
+        read -r -p "Номер порта (1–65535): " port || return 0
+        [[ $port =~ ^[0-9]{1,5}$ ]] && valid_port "$port" || { error "Некорректный порт."; continue; }
+        port=$((10#$port))
+        printf '  1) TCP\n  2) UDP\n  3) TCP + UDP\n'
+        read -r -p "Протокол [1]: " protocol || return 0
+        case "${protocol:-1}" in
+            1) protocol=tcp ;;
+            2) protocol=udp ;;
+            3) protocol=both ;;
+            *) error "Некорректный протокол."; continue ;;
+        esac
+        warn "Разрешение действует для всех IPv4-адресов, включая Docker-публикации. IP-блокировки сохраняются."
+        confirm "$verb ${port}/${protocol}?" || continue
+        if ! change_guard_port "$action" "$protocol" "$port"; then
+            error "Изменение порта не выполнено."
+        fi
+        pause
+    done
+}
+
 guard_menu() {
     require_root
     ensure_packages nftables python3 curl ca-certificates
@@ -605,6 +789,7 @@ guard_menu() {
         printf '  3) Настроить Geo-block по кодам стран\n'
         printf '  4) Показать статус и счётчики\n'
         printf '  5) Удалить только nftables-защиту\n'
+        printf '  6) Дополнительные TCP/UDP-порты\n'
         printf '  0) Назад\n\n'
         read -r -p "Выбор: " choice || true
         case $choice in
@@ -652,6 +837,7 @@ guard_menu() {
                 fi
                 pause
                 ;;
+            6) guard_ports_menu ;;
             0) return ;;
             *) warn "Неизвестный пункт."; sleep 1 ;;
         esac
@@ -1428,6 +1614,7 @@ show_menu() {
         printf '  7) ⚡ Установить XanMod\n'
         printf '  8) 🚄 Включить BBR\n'
         printf '  9) 📊 Показать состояние\n'
+        printf ' 10) 🔓 Дополнительные TCP/UDP-порты\n'
         printf '  0) 👋 Выход\n\n'
         read -r -p "Выберите пункт: " choice || true
         case $choice in
@@ -1440,6 +1627,7 @@ show_menu() {
             7) install_xanmod; pause ;;
             8) configure_bbr; pause ;;
             9) show_status; pause ;;
+            10) guard_ports_menu ;;
             0) success "Готово. Не забудьте проверить новый SSH-вход."; return ;;
             *) warn "Неизвестный пункт."; sleep 1 ;;
         esac

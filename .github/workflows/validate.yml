@@ -14,22 +14,10 @@ jobs:
       - uses: actions/checkout@v6
       - name: Check Bash syntax
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          source = Path("server_tool.sh").read_text()
-          for marker, target in (
-              ("GUARD_SCRIPT", "/tmp/server-tool-guard-update"),
-              ("CROWDSEC_FORWARD_SCRIPT", "/tmp/server-tool-crowdsec-forward"),
-          ):
-              start = source.index(f"<<'{marker}'")
-              start = source.index("\n", start) + 1
-              end = source.index(f"\n{marker}\n", start)
-              Path(target).write_text(source[start:end] + "\n")
-          PY
           bash -n server_tool.sh
+          bash -c 'source ./server_tool.sh; write_guard_updater /tmp/server-tool-guard-update'
           bash -n /tmp/server-tool-guard-update
-          bash -n /tmp/server-tool-crowdsec-forward
+          for test in tests/*.sh; do bash -n "$test"; done
       - name: Run ShellCheck
         shell: bash
         run: |
@@ -39,7 +27,7 @@ jobs:
           shellcheck --severity=warning --format=json1 \
             server_tool.sh \
             /tmp/server-tool-guard-update \
-            /tmp/server-tool-crowdsec-forward > /tmp/shellcheck.json
+            tests/guard_ports_test.sh > /tmp/shellcheck.json
           status=$?
           set -e
           python3 - <<'PY'
@@ -58,6 +46,11 @@ jobs:
               )
           PY
           exit "$status"
+      - name: Test custom ports, CrowdSec and APT recovery
+        run: |
+          bash tests/guard_ports_test.sh
+          bash tests/crowdsec_lapi_test.sh
+          bash tests/run_apt_test.sh
       - name: Smoke-test OS detection and status
         run: sudo bash server_tool.sh --status
       - name: Smoke-test SSH runtime directory recovery
@@ -76,6 +69,8 @@ jobs:
           NODE_PORT="2222"
           PANEL_IPV4="45.148.62.18"
           HTTPS_MODE="both"
+          EXTRA_TCP_PORTS="8443 9443"
+          EXTRA_UDP_PORTS="5353"
           BLOCKLIST_URLS=()
           GEO_COUNTRIES=""
           EOF
