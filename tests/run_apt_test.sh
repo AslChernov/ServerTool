@@ -2,8 +2,9 @@
 
 set -Eeuo pipefail
 
-readonly TEST_DIR=$(cd -- "${BASH_SOURCE[0]%/*}" && pwd)
-readonly REPO_ROOT=$(cd -- "${TEST_DIR}/.." && pwd)
+TEST_DIR=$(cd -- "${BASH_SOURCE[0]%/*}" && pwd)
+REPO_ROOT=$(cd -- "${TEST_DIR}/.." && pwd)
+readonly TEST_DIR REPO_ROOT
 
 # Sourcing the script is safe because its main entry point is guarded.
 # shellcheck disable=SC1091
@@ -17,7 +18,9 @@ export DPKG_TEST_COUNT_FILE="${work}/dpkg-count"
 export CROWDSEC_PREP_COUNT_FILE="${work}/crowdsec-prep-count"
 export CROWDSEC_SYNC_COUNT_FILE="${work}/crowdsec-sync-count"
 export CROWDSEC_WAIT_COUNT_FILE="${work}/crowdsec-wait-count"
+export CLEAN_TEST_COUNT_FILE="${work}/clean-count"
 APT_TEST_MODE=
+APT_TEST_CONFIRM=no
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
@@ -30,6 +33,7 @@ reset_calls() {
     printf '0\n' > "$CROWDSEC_PREP_COUNT_FILE"
     printf '0\n' > "$CROWDSEC_SYNC_COUNT_FILE"
     printf '0\n' > "$CROWDSEC_WAIT_COUNT_FILE"
+    printf '0\n' > "$CLEAN_TEST_COUNT_FILE"
 }
 
 call_count() {
@@ -40,6 +44,11 @@ call_count() {
 
 apt-get() {
     local count package
+    if [[ ${1:-} == clean ]]; then
+        read -r count < "$CLEAN_TEST_COUNT_FILE"
+        printf '%s\n' "$((count + 1))" > "$CLEAN_TEST_COUNT_FILE"
+        return 0
+    fi
     count=$(call_count)
     count=$((count + 1))
     printf '%s\n' "$count" > "$APT_TEST_COUNT_FILE"
@@ -81,6 +90,15 @@ apt-get() {
                 'E: Sub-process /usr/bin/dpkg returned an error code (1)' >&2
             return 100
             ;;
+        space_then_success|space_warning_then_success|persistent_space_error)
+            if ((count == 1)) || [[ $APT_TEST_MODE == persistent_space_error ]]; then
+                printf '%s\n' 'E: Write error - write (28: No space left on device)' \
+                    'E: Sub-process /usr/bin/dpkg returned an error code (1)' >&2
+                [[ $APT_TEST_MODE != space_warning_then_success ]] || return 0
+                return 100
+            fi
+            printf 'APT completed after cache cleanup\n'
+            ;;
         *)
             fail "unknown APT_TEST_MODE: $APT_TEST_MODE"
             ;;
@@ -96,6 +114,11 @@ dpkg() {
 }
 
 systemctl() { :; }
+package_disk_ready() { :; }
+show_disk_usage() { :; }
+log_package_failure() { :; }
+report_dpkg_state() { :; }
+confirm() { [[ $APT_TEST_CONFIRM == yes ]]; }
 
 sync_crowdsec_bouncer_lapi_url() {
     local count
@@ -182,5 +205,31 @@ fi
 [[ $(call_count) == 2 ]] || fail 'persistent dpkg error caused an unexpected retry loop'
 read -r dpkg_count < "$DPKG_TEST_COUNT_FILE"
 [[ $dpkg_count == 1 ]] || fail 'persistent dpkg recovery ran more than once'
+
+for mode in space_then_success space_warning_then_success; do
+    APT_TEST_MODE=$mode
+    APT_TEST_CONFIRM=yes
+    reset_calls
+    run_apt update >/dev/null 2>&1 || fail "$mode was not recovered"
+    [[ $(call_count) == 2 ]] || fail "$mode did not retry exactly once"
+    read -r clean_count < "$CLEAN_TEST_COUNT_FILE"
+    [[ $clean_count == 1 ]] || fail "$mode did not clean the cache exactly once"
+    read -r dpkg_count < "$DPKG_TEST_COUNT_FILE"
+    [[ $dpkg_count == 0 ]] || fail 'dpkg was attempted while the disk was full'
+done
+
+APT_TEST_MODE=persistent_space_error
+reset_calls
+if run_apt update >/dev/null 2>&1; then fail 'persistent ENOSPC unexpectedly succeeded'; fi
+[[ $(call_count) == 2 ]] || fail 'ENOSPC caused a retry loop'
+read -r dpkg_count < "$DPKG_TEST_COUNT_FILE"
+[[ $dpkg_count == 0 ]] || fail 'persistent ENOSPC triggered dpkg recovery'
+
+APT_TEST_CONFIRM=no
+reset_calls
+if run_apt update >/dev/null 2>&1; then fail 'ENOSPC succeeded after cleanup was declined'; fi
+[[ $(call_count) == 1 ]] || fail 'APT retried after cleanup was declined'
+read -r clean_count < "$CLEAN_TEST_COUNT_FILE"
+[[ $clean_count == 0 ]] || fail 'cache was deleted without confirmation'
 
 printf 'PASS: run_apt retry behavior\n'

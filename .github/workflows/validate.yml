@@ -27,7 +27,7 @@ jobs:
           shellcheck --severity=warning --format=json1 \
             server_tool.sh \
             /tmp/server-tool-guard-update \
-            tests/guard_ports_test.sh > /tmp/shellcheck.json
+            tests/*.sh > /tmp/shellcheck.json
           status=$?
           set -e
           python3 - <<'PY'
@@ -46,11 +46,13 @@ jobs:
               )
           PY
           exit "$status"
-      - name: Test custom ports, CrowdSec and APT recovery
+      - name: Test profiles, cleanup, ports, CrowdSec and APT recovery
         run: |
           bash tests/guard_ports_test.sh
           bash tests/crowdsec_lapi_test.sh
           bash tests/run_apt_test.sh
+          bash tests/server_profile_test.sh
+          bash tests/cleanup_test.sh
       - name: Smoke-test OS detection and status
         run: sudo bash server_tool.sh --status
       - name: Smoke-test SSH runtime directory recovery
@@ -74,15 +76,32 @@ jobs:
           BLOCKLIST_URLS=()
           GEO_COUNTRIES=""
           EOF
-          set +e
-          output=$(sudo /usr/local/sbin/server-tool-guard-update --check 2>&1)
-          status=$?
-          set -e
-          printf '%s\n' "$output"
-          if ((status != 0)); then
-            message=${output//'%'/'%25'}
-            message=${message//$'\r'/'%0D'}
-            message=${message//$'\n'/'%0A'}
-            echo "::error file=server_tool.sh,title=nftables validation::${message}"
-          fi
-          exit "$status"
+          check_rules() {
+            local output status
+            if output=$(sudo /usr/local/sbin/server-tool-guard-update --check 2>&1); then
+              printf '%s\n' "$output"
+            else
+              status=$?
+              printf '%s\n' "$output"
+              message=${output//'%'/'%25'}
+              message=${message//$'\r'/'%0D'}
+              message=${message//$'\n'/'%0A'}
+              echo "::error file=server_tool.sh,title=nftables validation::${message}"
+              return "$status"
+            fi
+          }
+          check_rules
+          sudo tee /etc/server-tool/guard.conf >/dev/null <<'EOF'
+          SERVER_ROLE="server"
+          SSH_PORT="35425"
+          SSH_SOURCES="192.0.2.10 2001:db8::10"
+          ENABLE_IPV6="yes"
+          HTTPS_MODE="none"
+          EXTRA_TCP_PORTS="80 443"
+          EXTRA_UDP_PORTS="443"
+          RESTRICTED_RULES=("tcp|9090|192.0.2.0/24" "tcp|9090|2001:db8:1::/48")
+          BLOCKLIST_ENABLED="no"
+          BLOCKLIST_URLS=()
+          GEO_COUNTRIES=""
+          EOF
+          check_rules

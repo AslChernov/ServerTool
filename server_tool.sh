@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# ServerTool — interactive post-install hardening for a Remnawave node.
+# ServerTool — interactive maintenance and hardening for Ubuntu/Debian servers.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly APP_VERSION="3.1.0"
+readonly APP_VERSION="3.2.0"
 readonly APP_NAME="ServerTool"
 readonly APT_LOCK_TIMEOUT=300
 readonly APT_LOCK_RETRY_DELAY=5
 readonly CONFIG_DIR="/etc/server-tool"
+readonly PROFILE_FILE="${CONFIG_DIR}/profile"
 readonly BACKUP_ROOT="/var/backups/server-tool"
 readonly LOG_FILE="/var/log/server-tool.log"
 readonly SSH_DROPIN="/etc/ssh/sshd_config.d/00-server-tool.conf"
@@ -31,6 +32,7 @@ readonly DEFAULT_PANEL_IP="45.148.62.18"
 readonly DEFAULT_NODE_PORT="2222"
 readonly REMNAWAVE_NGINX_CONTAINER="remnawave-nginx"
 readonly REMNANODE_CONTAINER="remnanode"
+SERVER_ROLE=node
 
 if [[ -t 1 ]]; then
     readonly RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[1;33m'
@@ -97,7 +99,41 @@ require_supported_os() {
         warn "XanMod доступен только для amd64; остальные разделы продолжат работать."
 }
 
-valid_port() { [[ ${1:-} =~ ^[0-9]+$ ]] && ((1 <= 10#$1 && 10#$1 <= 65535)); }
+load_server_profile() {
+    SERVER_ROLE=node
+    if [[ -f $PROFILE_FILE ]]; then
+        read -r SERVER_ROLE < "$PROFILE_FILE" || return 1
+    fi
+    [[ $SERVER_ROLE == node || $SERVER_ROLE == server ]] || {
+        error "Некорректный профиль в ${PROFILE_FILE}. Ожидается node или server."
+        return 1
+    }
+}
+
+profile_label() {
+    case "${1:-$SERVER_ROLE}" in
+        node) printf 'Нода Remnawave\n' ;;
+        server) printf 'Универсальный сервер\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+choose_server_profile() {
+    local choice default=1
+    [[ $SERVER_ROLE != server ]] || default=2
+    printf '\nДля какого сервера выполняется настройка?\n  1) Нода Remnawave\n  2) Универсальный сервер (панель, сайт, API, бот и другой софт)\n  0) Назад\n' >&2
+    while true; do
+        read -r -p "Выбор [${default}]: " choice || return 1
+        case "${choice:-$default}" in
+            1) printf 'node\n'; return ;;
+            2) printf 'server\n'; return ;;
+            0) return 1 ;;
+            *) printf 'Введите 0, 1 или 2.\n' >&2 ;;
+        esac
+    done
+}
+
+valid_port() { [[ ${1:-} =~ ^[0-9]{1,5}$ ]] && ((1 <= 10#$1 && 10#$1 <= 65535)); }
 
 normalize_guard_ports() {
     local raw="${1:-}" port result=""
@@ -117,15 +153,45 @@ normalize_guard_ports() {
 }
 
 validate_guard_extra_ports() {
-    local tcp_ports="$1" udp_ports="$2" node_port="$3" ssh_port="$4" port
+    local tcp_ports="$1" udp_ports="$2" node_port="$3" ssh_port="$4" role="${5:-node}" port
     local -a ports=()
     IFS=' ' read -r -a ports <<< "$tcp_ports $udp_ports"
     for port in "${ports[@]}"; do
-        if ((port == 443 || port == 10#$node_port || port == 10#$ssh_port)); then
+        if ((port == 10#$ssh_port)) ||
+            { [[ $role == node ]] && ((port == 443 || port == 10#$node_port)); }; then
             echo "Порт ${port} управляется основными настройками SSH/API/443, а не дополнительными портами." >&2
             return 1
         fi
     done
+}
+
+normalize_ip_sources() {
+    python3 - "${1:-}" <<'PY'
+import ipaddress, sys
+try:
+    print(" ".join(dict.fromkeys(str(ipaddress.ip_network(x, strict=False))
+                                for x in sys.argv[1].replace(",", " ").split())))
+except ValueError as exc:
+    raise SystemExit(f"Некорректный IP/CIDR: {exc}")
+PY
+}
+
+normalize_access_rules() {
+    python3 - "$@" <<'PY'
+import ipaddress, sys
+try:
+    rules = []
+    for raw in sys.argv[1:]:
+        protocol, port, source = raw.split("|")
+        if protocol not in ("tcp", "udp") or not port.isascii() or not port.isdigit() or not 1 <= int(port) <= 65535:
+            raise ValueError(raw)
+        rule = f"{protocol}|{int(port)}|{ipaddress.ip_network(source, strict=False)}"
+        if rule not in rules:
+            rules.append(rule)
+    print("\n".join(rules))
+except ValueError as exc:
+    raise SystemExit(f"Некорректное правило доступа: {exc}")
+PY
 }
 
 read_guard_extra_ports() (
@@ -137,6 +203,13 @@ read_guard_extra_ports() (
         udp) normalize_guard_ports "$EXTRA_UDP_PORTS" ;;
         *) return 1 ;;
     esac
+)
+
+read_guard_setting() (
+    local key="$1" fallback="${2:-}" SERVER_ROLE=node
+    # shellcheck disable=SC1090
+    [[ ! -r $GUARD_CONFIG ]] || source "$GUARD_CONFIG"
+    printf '%s\n' "${!key-$fallback}"
 )
 
 valid_ipv4_cidr() {
@@ -216,10 +289,11 @@ prepare_dpkg_recovery_context() {
 recover_dpkg_state() {
     local failed_output="$1" output_file status fix_status
     local -a pipe_status
+    package_disk_ready || return 1
     warn "dpkg не завершил настройку пакетов. Выполняется одна попытка штатного восстановления."
     prepare_dpkg_recovery_context "$failed_output"
 
-    output_file=$(mktemp /tmp/server-tool-dpkg.XXXXXX)
+    output_file=$(package_output_file) || return 1
     if LC_ALL=C DEBIAN_FRONTEND=noninteractive dpkg --configure --pending 2>&1 | tee "$output_file"; then
         status=0
     else
@@ -245,9 +319,12 @@ recover_dpkg_state() {
 
 run_apt() {
     local output_file status deadline remaining delay command
-    local recovery_attempted=0
+    local recovery_attempted=0 space_recovery_attempted=0
     local -a pipe_status
-    output_file=$(mktemp /tmp/server-tool-apt.XXXXXX)
+    output_file=$(package_output_file) || {
+        error "Не удалось создать временный файл APT. Проверьте место и inode через пункт 11."
+        return 1
+    }
     deadline=$((SECONDS + APT_LOCK_TIMEOUT))
     printf -v command '%q ' apt-get "$@"
     command=${command% }
@@ -255,12 +332,32 @@ run_apt() {
     while true; do
         : > "$output_file"
         if LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get "$@" 2>&1 | tee "$output_file"; then
-            rm -f "$output_file"
-            return 0
+            status=0
         else
             pipe_status=("${PIPESTATUS[@]}")
             status=${pipe_status[0]}
             ((status != 0)) || status=${pipe_status[1]:-1}
+        fi
+
+        if grep -Eqi 'no space left on device|not enough free space|write \(28:|disk full' "$output_file"; then
+            ((status != 0)) || status=100
+            log_package_failure "$command" "$output_file"
+            error "APT не хватает места или inode. Восстановление dpkg до очистки не запускается."
+            show_disk_usage
+            if ((space_recovery_attempted == 0)) && [[ ${APT_SPACE_RECOVERY_ACTIVE:-0} != 1 ]] &&
+                confirm "Очистить только скачанный кэш APT и повторить команду один раз?"; then
+                space_recovery_attempted=1
+                if APT_SPACE_RECOVERY_ACTIVE=1 cleanup_apt_cache; then
+                    continue
+                fi
+            fi
+            rm -f -- "$output_file"
+            error "Освободите место через пункт 11 и повторите операцию."
+            return "$status"
+        fi
+        if ((status == 0)); then
+            rm -f -- "$output_file"
+            return 0
         fi
 
         if ((status == 100)) && grep -Eqi \
@@ -283,7 +380,7 @@ run_apt() {
         log_package_failure "$command" "$output_file"
         if ((status == 100 && recovery_attempted == 0)) && \
             [[ ${APT_DPKG_RECOVERY_ACTIVE:-0} != 1 ]] && \
-            grep -Eqi 'sub-process .*dpkg.*returned an error code|dpkg: error processing package' "$output_file"; then
+            grep -Eqi 'sub-process .*dpkg.*returned an error code|dpkg: error processing package|dpkg was interrupted' "$output_file"; then
             recovery_attempted=1
             if recover_dpkg_state "$output_file"; then
                 warn "Повтор команды после восстановления: ${command}"
@@ -309,17 +406,307 @@ ensure_packages() {
     done
     if ((${#missing[@]})); then
         step "Установка пакетов: ${missing[*]}"
-        run_apt update
-        run_apt install -y --no-install-recommends "${missing[@]}"
+        run_apt update || return 1
+        run_apt install -y --no-install-recommends "${missing[@]}" || return 1
     fi
 }
 
 make_backup() {
     local label="$1" dir
-    dir="${BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)-${label}"
-    mkdir -p "$dir"
-    chmod 700 "$dir"
+    mkdir -p "$BACKUP_ROOT" || return 1
+    dir=$(mktemp -d "${BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)-${label}.XXXXXX") || return 1
     printf '%s\n' "$dir"
+}
+
+package_output_file() {
+    local directory="${TMPDIR:-/tmp}"
+    [[ ! -d /run || ! -w /run ]] || directory=/run
+    mktemp "${directory}/server-tool-apt.XXXXXX"
+}
+
+show_disk_usage() {
+    step "Место на дисках и inode"
+    df -hT / /var /tmp /boot 2>/dev/null || true
+    df -ih / /var /tmp /boot 2>/dev/null || true
+}
+
+disk_diagnostics() {
+    show_disk_usage
+    step "Крупные каталоги /var и /opt (без перехода на другие файловые системы)"
+    du -xhd1 /var /opt 2>/dev/null | sort -h || true
+    step "Кэш, журналы и резервные копии ServerTool"
+    du -sh /var/cache/apt/archives /var/log "$BACKUP_ROOT" 2>/dev/null || true
+    journalctl --disk-usage 2>/dev/null || true
+    if command -v docker >/dev/null 2>&1; then
+        docker system df || true
+    fi
+}
+
+package_disk_ready() {
+    local path available inodes minimum boot_device root_device
+    for path in / /var /var/lib/apt /var/cache/apt /tmp /boot; do
+        [[ -d $path ]] || continue
+        minimum=524288 # 512 MiB is a working reserve, not the size of a full upgrade.
+        [[ $path != /tmp ]] || minimum=32768
+        if [[ $path == /boot ]]; then
+            boot_device=$(df -Pk /boot | awk 'NR == 2 {print $1}') || return 1
+            root_device=$(df -Pk / | awk 'NR == 2 {print $1}') || return 1
+            [[ $boot_device != "$root_device" ]] || continue
+            minimum=131072
+        fi
+        available=$(df -Pk "$path" | awk 'NR == 2 {print $4}') || return 1
+        inodes=$(df -Pi "$path" | awk 'NR == 2 {print ($2 > 0 ? $4 : "-")}') || return 1
+        if [[ ! $available =~ ^[0-9]+$ ]] || ((available < minimum)) ||
+            { [[ $inodes =~ ^[0-9]+$ ]] && ((inodes < 1024)); }; then
+            error "Недостаточно места или inode на разделе ${path}. Сначала используйте меню очистки (11)."
+            return 1
+        fi
+    done
+}
+
+cleanup_apt_cache() {
+    run_apt clean || return 1
+    success "Удалён скачанный кэш APT, включая незавершённые загрузки пакетов."
+}
+
+cleanup_temporary_files() {
+    command -v systemd-tmpfiles >/dev/null 2>&1 || {
+        error "systemd-tmpfiles не найден; временные файлы не изменены."; return 1;
+    }
+    systemd-tmpfiles --clean || return 1
+    success "Просроченные временные файлы очищены по системным правилам tmpfiles.d."
+}
+
+backup_cleanup_candidates() {
+    local directory="$1" days="$2" kind="$3" pattern="${4:-*.tar.gz}"
+    python3 - "$directory" "$days" "$kind" "$pattern" "$BACKUP_ROOT" <<'PY'
+import fnmatch, os, re, stat, sys, time
+root, days, kind, pattern, own_root = sys.argv[1:]
+try:
+    if not days.isascii() or not days.isdigit() or not 1 <= int(days) <= 36500:
+        raise ValueError("Срок хранения должен быть от 1 до 36500 дней")
+    if kind not in ("own", "custom"):
+        raise ValueError("Неизвестный тип резервных копий")
+    protected = ("/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot",
+                 "/proc", "/sys", "/dev", "/run", "/var/lib", "/var/cache", "/var/log")
+    requested = root.rstrip("/") or "/"
+    if not os.path.isabs(root) or os.path.abspath(root) != os.path.realpath(root):
+        raise ValueError("Нужен абсолютный каталог без символических ссылок")
+    root = os.path.realpath(root)
+    for checked in (requested, root):
+        if checked in ("/", "/var", "/opt", "/home", "/root", "/tmp", "/var/tmp", "/var/backups") or any(
+            checked == x or checked.startswith(x + "/") for x in protected
+        ):
+            raise ValueError("Выберите отдельный каталог резервных копий, а не системный каталог")
+    if kind == "own" and root != os.path.realpath(own_root):
+        raise ValueError("Неверный каталог копий ServerTool")
+    if not pattern or "/" in pattern or "\\" in pattern or any(ord(x) < 32 for x in pattern + root):
+        raise ValueError("Некорректный каталог или шаблон имени")
+    groups = {}
+    suffixes = (".tar", ".tar.gz", ".tgz", ".tar.xz", ".tar.zst", ".zip", ".sql", ".sql.gz", ".dump", ".bak")
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if entry.is_symlink() or os.path.ismount(entry.path):
+                continue
+            group = "custom"
+            if kind == "own":
+                match = re.fullmatch(r"\d{8}-\d{6}-(ssh|firewall)(?:\.[A-Za-z0-9]{6})?", entry.name)
+                if match:
+                    group = match[1]
+                    required = "sshd_config" if group == "ssh" else "nft-ruleset.txt"
+                elif re.fullmatch(r"ports\.[A-Za-z0-9]{6}", entry.name):
+                    group, required = "ports", "guard.conf"
+                else:
+                    continue
+                if not entry.is_dir(follow_symlinks=False) or not os.path.isfile(os.path.join(entry.path, required)):
+                    continue
+            elif not entry.is_file(follow_symlinks=False) or not entry.name.endswith(suffixes) or not fnmatch.fnmatchcase(entry.name, pattern):
+                continue
+            item = entry.stat(follow_symlinks=False)
+            groups.setdefault(group, []).append((item.st_mtime_ns, entry.name, entry.path, item))
+    cutoff = time.time() - int(days) * 86400
+    candidates = []
+    for items in groups.values():
+        for _, _, path, item in sorted(items, reverse=True)[3:]:
+            if item.st_mtime < cutoff:
+                candidates.append((path, item))
+    # A file with an archive extension can still be an active backup.
+    opened = set()
+    wanted = {(item.st_dev, item.st_ino) for _, item in candidates}
+    if candidates and os.path.isdir("/proc"):
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                for fd in os.listdir(f"/proc/{pid}/fd"):
+                    try:
+                        item = os.stat(f"/proc/{pid}/fd/{fd}")
+                        identity = (item.st_dev, item.st_ino)
+                        if identity in wanted:
+                            opened.add(identity)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+    for path, item in sorted(candidates):
+        if stat.S_ISDIR(item.st_mode) or (item.st_dev, item.st_ino) not in opened:
+            sys.stdout.buffer.write(os.fsencode(path) + b"\0")
+except (OSError, ValueError) as exc:
+    raise SystemExit(f"Очистка копий отклонена: {exc}")
+PY
+}
+
+cleanup_backups() {
+    local kind directory days pattern='*.tar.gz' choice plan check path size modified
+    local -a candidates=()
+    printf '\n  1) Копии ServerTool\n  2) Копии другого приложения\n  0) Назад\n'
+    read -r -p "Выбор: " choice || return 0
+    case "$choice" in
+        1) kind=own; directory=$BACKUP_ROOT ;;
+        2)
+            kind=custom
+            info "Укажите отдельный каталог и шаблон завершённых копий одного приложения."
+            read -r -p "Абсолютный путь к каталогу: " directory || return 0
+            read -r -p "Шаблон имён [*.tar.gz]: " pattern || return 0
+            pattern=${pattern:-'*.tar.gz'}
+            ;;
+        0) return 0 ;;
+        *) error "Неизвестный пункт."; return 1 ;;
+    esac
+    read -r -p "Удалять копии старше скольких дней [30]: " days || return 0
+    days=${days:-30}
+    plan=$(package_output_file) || return 1
+    if ! backup_cleanup_candidates "$directory" "$days" "$kind" "$pattern" > "$plan"; then
+        rm -f -- "$plan"; return 1
+    fi
+    mapfile -d '' -t candidates < "$plan"
+    if ((${#candidates[@]} == 0)); then
+        rm -f -- "$plan"
+        info "Подходящих старых копий нет. Последние три копии каждого типа сохраняются."
+        return 0
+    fi
+    warn "Будут безвозвратно удалены только перечисленные копии старше ${days} дней:"
+    for path in "${candidates[@]}"; do
+        size=$(du -sh -- "$path") || { rm -f -- "$plan"; return 1; }
+        modified=$(date -r "$path" '+%F %T') || { rm -f -- "$plan"; return 1; }
+        printf '  %s  %s  %q\n' "${size%%$'\t'*}" "$modified" "$path"
+    done
+    info "Последние три копии каждого типа сохраняются. Символические ссылки исключены."
+    if ! confirm "Удалить эти ${#candidates[@]} копии?"; then
+        rm -f -- "$plan"; return 0
+    fi
+    check=$(package_output_file) || { rm -f -- "$plan"; return 1; }
+    if ! backup_cleanup_candidates "$directory" "$days" "$kind" "$pattern" > "$check" || ! cmp -s "$plan" "$check"; then
+        rm -f -- "$plan" "$check"
+        error "Список копий изменился. Повторите просмотр; удаление отменено."
+        return 1
+    fi
+    rm -f -- "$plan" "$check"
+    for path in "${candidates[@]}"; do
+        [[ ! -L $path && $(realpath -e -- "${path%/*}") == "$(realpath -e -- "$directory")" ]] || return 1
+        if [[ $kind == own ]]; then
+            rm -r --one-file-system -- "$path" || return 1
+        else
+            [[ -f $path ]] || return 1
+            rm -- "$path" || return 1
+        fi
+        log INFO "old backup removed: ${path}"
+    done
+    success "Удалено копий: ${#candidates[@]}. Восстановление возможно только из другой резервной копии."
+}
+
+autoremove_plan_is_safe() {
+    local plan="$1" running fallback package
+    running=$(uname -r)
+    fallback=$(dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' 'linux-image-*' 2>/dev/null |
+        awk '$2 == "ii" {sub(/:[^:]+$/, "", $1); sub(/^linux-image-(unsigned-)?/, "", $1); if ($1 ~ /^[0-9]/) print $1}' |
+        sort -Vr | awk -v running="$running" '$0 != running {print; exit}' || true)
+    while read -r package; do
+        if [[ $package == *"$running"* || ( -n $fallback && $package == *"$fallback"* ) ]]; then
+            error "APT предлагает удалить работающее или резервное ядро (${package}). Автоудаление отменено."
+            return 1
+        fi
+    done < <(awk '$1 == "Remv" {print $2}' "$plan")
+}
+
+cleanup_packages() {
+    local plan
+    if [[ -n $(dpkg --audit 2>/dev/null) ]]; then
+        error "Сначала восстановите незавершённые пакеты через пункт 7 меню очистки."; return 1
+    fi
+    plan=$(package_output_file) || return 1
+    if ! LC_ALL=C apt-get -s autoremove > "$plan"; then
+        rm -f -- "$plan"; return 1
+    fi
+    cat "$plan"
+    if ! autoremove_plan_is_safe "$plan"; then
+        rm -f -- "$plan"; return 1
+    fi
+    rm -f -- "$plan"
+    confirm "Удалить только предлагаемые APT ненужные пакеты?" || return 0
+    run_apt autoremove -y || return 1
+    success "Ненужные пакеты удалены штатным пакетным менеджером."
+}
+
+cleanup_menu() {
+    require_root
+    local choice before after limit
+    while true; do
+        printf '\n%bОЧИСТКА СЕРВЕРА%b\n' "$BOLD" "$NC"
+        printf '  1) Диагностика заполнения диска\n  2) Кэш APT и просроченные временные файлы\n  3) Старые системные журналы\n  4) Docker build cache и висячие образы\n  5) Старые резервные копии\n  6) Ненужные пакеты и старые ядра\n  7) Восстановить прерванную настройку dpkg\n  0) Назад\n\n'
+        read -r -p "Выбор: " choice || return 0
+        before=$(df -Pk / | awk 'NR == 2 {print $4}')
+        case "$choice" in
+            0) return 0 ;;
+            1) disk_diagnostics ;;
+            2)
+                du -sh /var/cache/apt/archives /tmp /var/tmp 2>/dev/null || true
+                if confirm "Очистить кэш APT и временные файлы по правилам tmpfiles.d?"; then
+                    cleanup_apt_cache || error "Не удалось очистить кэш APT."
+                    cleanup_temporary_files || error "Не удалось очистить временные файлы."
+                fi
+                ;;
+            3)
+                journalctl --disk-usage || { error "Журнал systemd недоступен."; continue; }
+                read -r -p "Лимит архивных журналов в МиБ [200]: " limit || return 0
+                limit=${limit:-200}
+                [[ $limit =~ ^[0-9]{1,6}$ ]] && ((10#$limit >= 10)) || { error "Укажите от 10 до 999999 МиБ."; continue; }
+                warn "Старые записи будут безвозвратно удалены."
+                if confirm "Выполнить ротацию и сократить архивы до ${limit} МиБ?"; then
+                    if journalctl --rotate --vacuum-size="$((10#$limit))M"; then
+                        success "Архивные журналы очищены; текущие журналы могут занимать дополнительное место."
+                    else
+                        error "Не удалось очистить системные журналы."
+                    fi
+                fi
+                ;;
+            4)
+                command -v docker >/dev/null 2>&1 || { info "Docker не установлен."; continue; }
+                docker system df || { error "Docker недоступен."; continue; }
+                warn "Будут удалены неиспользуемый build cache и образы без тегов, не связанные с контейнерами. Следующая сборка займёт больше времени; эти образы могут быть нужны для отката."
+                if confirm "Очистить эти объекты Docker?"; then
+                    docker builder prune -f || error "Не удалось очистить build cache."
+                    docker image prune -f || error "Не удалось очистить висячие образы."
+                fi
+                ;;
+            5) cleanup_backups || error "Очистка резервных копий не завершена." ;;
+            6) cleanup_packages || error "Удаление пакетов не выполнено." ;;
+            7)
+                if confirm "Выполнить dpkg --configure --pending и APT --fix-broken?"; then
+                    if package_disk_ready; then
+                        recover_dpkg_state /dev/null || error "Не удалось восстановить пакеты."
+                    fi
+                fi
+                ;;
+            *) warn "Неизвестный пункт."; continue ;;
+        esac
+        after=$(df -Pk / | awk 'NR == 2 {print $4}')
+        if [[ $before =~ ^[0-9]+$ && $after =~ ^[0-9]+$ ]] && ((after > before)); then
+            printf '\nОсвобождено на корневом разделе: %s МиБ\n' "$(((after - before) / 1024))"
+        fi
+        show_disk_usage
+        pause
+    done
 }
 
 detect_ssh_port() {
@@ -336,10 +723,19 @@ detect_ssh_port() {
 system_update() {
     require_root
     step "Обновление системы"
-    run_apt update
-    run_apt full-upgrade -y
-    run_apt autoremove -y
-    run_apt autoclean
+    package_disk_ready || { show_disk_usage; return 1; }
+    run_apt update || return 1
+    if [[ -n $(dpkg --audit 2>/dev/null) ]]; then
+        recover_dpkg_state /dev/null || return 1
+    fi
+    if [[ $SERVER_ROLE == server ]]; then
+        run_apt -s upgrade --with-new-pkgs --no-remove || return 1
+        confirm "Обновить показанные системные пакеты? Сервисы могут перезапуститься." || return 0
+        run_apt upgrade --with-new-pkgs --no-remove -y || return 1
+    else
+        run_apt full-upgrade -y || return 1
+    fi
+    run_apt autoclean || return 1
     success "Система обновлена."
     [[ ! -f /var/run/reboot-required ]] || warn "Для завершения обновления нужна перезагрузка."
     log INFO "system update completed"
@@ -356,25 +752,163 @@ choose_https_mode() {
     done
 }
 
+prepare_firewall_rollback() {
+    local backup="$1" ufw_active="$2" file service_enabled=no timer_enabled=no timer_active=no service_active=no
+    command -v systemd-run >/dev/null 2>&1 && command -v flock >/dev/null 2>&1 || {
+        error "systemd-run и flock нужны для автоматического отката firewall."; return 1;
+    }
+    nft list tables >/dev/null || return 1
+    mkdir -p "$backup/files" || return 1
+    local -a files=("$GUARD_CONFIG" "$GUARD_UPDATER" "$GUARD_SERVICE" "$GUARD_UPDATE_SERVICE" "$GUARD_TIMER")
+    for file in "${files[@]}"; do
+        [[ ! -L $file ]] || { error "Отказ от замены символической ссылки: ${file}"; return 1; }
+        [[ ! -e $file ]] || cp -p -- "$file" "$backup/files/" || return 1
+    done
+    if ! nft list table inet server_tool_guard > "$backup/guard-table.nft" 2>/dev/null; then
+        : > "$backup/guard-table.nft"
+    fi
+    systemctl is-enabled --quiet server-tool-guard.service && service_enabled=yes
+    systemctl is-enabled --quiet server-tool-guard.timer && timer_enabled=yes
+    systemctl is-active --quiet server-tool-guard.timer && timer_active=yes
+    systemctl is-active --quiet server-tool-guard.service && service_active=yes
+    {
+        printf '#!/usr/bin/env bash\nset -Eeuo pipefail\numask 077\n'
+        printf 'backup=%q\nufw_active=%q\nservice_enabled=%q\ntimer_enabled=%q\ntimer_active=%q\nservice_active=%q\n' \
+            "$backup" "$ufw_active" "$service_enabled" "$timer_enabled" "$timer_active" "$service_active"
+        printf 'files=('
+        printf ' %q' "${files[@]}"
+        printf ' )\n'
+        cat <<'ROLLBACK'
+exec 9>"$backup/rollback.lock"
+flock -x 9
+[[ ! -e $backup/rollback-completed ]] || exit 0
+touch "$backup/rollback-started"
+systemctl disable --now server-tool-guard.timer server-tool-guard.service 2>/dev/null || true
+systemctl stop server-tool-guard-update.service 2>/dev/null || true
+for file in "${files[@]}"; do
+    if [[ -f $backup/files/${file##*/} ]]; then
+        cp -p -- "$backup/files/${file##*/}" "$file"
+    else
+        rm -f -- "$file"
+    fi
+done
+{
+    if nft list table inet server_tool_guard >/dev/null 2>&1; then
+        printf 'delete table inet server_tool_guard\n'
+    fi
+    cat "$backup/guard-table.nft"
+} > "$backup/rollback.nft"
+if [[ -s $backup/rollback.nft ]]; then
+    nft --check --file "$backup/rollback.nft"
+    nft --file "$backup/rollback.nft"
+fi
+systemctl daemon-reload
+[[ $service_enabled != yes ]] || systemctl enable server-tool-guard.service
+[[ $timer_enabled != yes ]] || systemctl enable server-tool-guard.timer
+[[ $service_active != yes ]] || systemctl start server-tool-guard.service
+[[ $timer_active != yes ]] || systemctl start server-tool-guard.timer
+[[ $ufw_active != yes ]] || ufw --force enable
+touch "$backup/rollback-completed"
+ROLLBACK
+    } > "$backup/rollback.sh" || return 1
+    chmod 700 "$backup/rollback.sh"
+}
+
 configure_firewall() {
     require_root
-    ensure_packages nftables python3 curl ca-certificates
-    local ssh_port https_mode node_port panel_ip backup
+    ensure_packages nftables python3 curl ca-certificates iproute2 || return 1
+    local ssh_port https_mode=none node_port="" panel_ip="" backup current_role
+    local tcp_ports="" udp_ports="" ssh_sources="" ipv6=no blocklists=yes answer protocol port source rule
+    local ufw_active=no rollback_unit
+    local -a restricted_rules=()
     ssh_port=$(detect_ssh_port)
     info "Обнаружен SSH-порт: ${ssh_port}/tcp"
-    https_mode=$(choose_https_mode)
-    read -r -p "Порт Remnawave-ноды [${DEFAULT_NODE_PORT}]: " node_port || true
-    node_port=${node_port:-$DEFAULT_NODE_PORT}
-    valid_port "$node_port" || { error "Некорректный порт."; return 1; }
-    read -r -p "IPv4/CIDR панели, которой разрешён порт ${node_port} [${DEFAULT_PANEL_IP}]: " panel_ip || true
-    panel_ip=${panel_ip:-$DEFAULT_PANEL_IP}
-    valid_ipv4_cidr "$panel_ip" || { error "Некорректный IPv4 или CIDR."; return 1; }
+    current_role=$(read_guard_setting SERVER_ROLE node) || return 1
+    if [[ $current_role == "$SERVER_ROLE" ]]; then
+        tcp_ports=$(read_guard_extra_ports tcp) || return 1
+        udp_ports=$(read_guard_extra_ports udp) || return 1
+    fi
+    if [[ $SERVER_ROLE == node ]]; then
+        https_mode=$(choose_https_mode)
+        read -r -p "Порт Remnawave-ноды [${DEFAULT_NODE_PORT}]: " node_port || return 0
+        node_port=${node_port:-$DEFAULT_NODE_PORT}
+        valid_port "$node_port" || { error "Некорректный порт."; return 1; }
+        read -r -p "IPv4/CIDR панели, которой разрешён порт ${node_port} [${DEFAULT_PANEL_IP}]: " panel_ip || return 0
+        panel_ip=${panel_ip:-$DEFAULT_PANEL_IP}
+        valid_ipv4_cidr "$panel_ip" || { error "Некорректный IPv4 или CIDR."; return 1; }
+    else
+        step "Действующие сервисы и опубликованные Docker-порты"
+        ss -lntup || return 1
+        if command -v docker >/dev/null 2>&1; then
+            docker ps --format 'table {{.Names}}\t{{.Ports}}' || true
+        fi
+        info "Укажите нужные публичные порты через пробел. Пусто — оставить список, '-' — очистить. Обнаруженные сервисы автоматически не открываются."
+        read -r -p "Публичные TCP-порты [${tcp_ports:-нет}]: " answer || return 0
+        [[ $answer != - ]] || tcp_ports=""
+        [[ $answer == - ]] || tcp_ports=${answer:-$tcp_ports}
+        tcp_ports=$(normalize_guard_ports "$tcp_ports") || { error "Некорректные TCP-порты."; return 1; }
+        read -r -p "Публичные UDP-порты [${udp_ports:-нет}]: " answer || return 0
+        [[ $answer != - ]] || udp_ports=""
+        [[ $answer == - ]] || udp_ports=${answer:-$udp_ports}
+        udp_ports=$(normalize_guard_ports "$udp_ports") || { error "Некорректные UDP-порты."; return 1; }
+        if [[ $current_role == server ]]; then
+            ssh_sources=$(read_guard_setting SSH_SOURCES) || return 1
+        fi
+        read -r -p "IP/CIDR для SSH [${ssh_sources:-все}]; '-' = все: " answer || return 0
+        [[ $answer != - ]] || ssh_sources=""
+        [[ $answer == - ]] || ssh_sources=${answer:-$ssh_sources}
+        ssh_sources=$(normalize_ip_sources "$ssh_sources") || return 1
+        confirm "Разрешать выбранные сервисы также по IPv6?" Y && ipv6=yes
+        if [[ $ipv6 == no && ( $ssh_sources == *:* || ${SSH_CONNECTION:-} == *:* ) ]]; then
+            error "SSH использует IPv6: включите IPv6, чтобы сохранить доступ."; return 1
+        fi
+        if [[ $current_role == server ]]; then
+            mapfile -t restricted_rules < <(
+                # shellcheck disable=SC1090
+                source "$GUARD_CONFIG"
+                printf '%s\n' "${RESTRICTED_RULES[@]:-}"
+            )
+            [[ ${restricted_rules[0]:-} != "" ]] || restricted_rules=()
+            if ((${#restricted_rules[@]})); then
+                printf 'Сохранённые ограничения (протокол|порт|IP/CIDR):\n  %s\n' "${restricted_rules[@]}"
+                confirm "Сохранить эти ограничения?" Y || restricted_rules=()
+            fi
+        fi
+        info "Добавьте порты с доступом только от IP/CIDR. Пустой номер завершает ввод."
+        while true; do
+            read -r -p "Ограниченный порт [Enter = продолжить]: " port || return 0
+            [[ -n $port ]] || break
+            [[ $port =~ ^[0-9]{1,5}$ ]] && valid_port "$port" || { error "Некорректный порт."; return 1; }
+            read -r -p "Протокол [tcp]: " protocol || return 0
+            protocol=${protocol:-tcp}
+            read -r -p "Разрешённый IP/CIDR: " source || return 0
+            rule=$(normalize_access_rules "${protocol}|${port}|${source}") || return 1
+            restricted_rules+=("$rule")
+        done
+        blocklists=no
+        confirm "Включить внешние Anti-Scanner/IP-списки?" && blocklists=yes
+    fi
 
     printf '\nБудут применены правила:\n'
-    printf '  🔐 SSH:             %s/tcp — для всех\n' "$ssh_port"
-    printf '  🌐 VPN 443:         %s\n' "$https_mode"
-    printf '  🧩 Remnawave API:   %s/tcp — только %s\n' "$node_port" "$panel_ip"
+    printf '  Профиль:           %s\n' "$(profile_label)"
+    printf '  🔐 SSH:             %s/tcp — %s\n' "$ssh_port" "${ssh_sources:-для всех}"
+    printf '  Публичные TCP:     %s\n  Публичные UDP:     %s\n' "${tcp_ports:-нет}" "${udp_ports:-нет}"
+    if [[ $SERVER_ROLE == node ]]; then
+        printf '  🌐 VPN 443:         %s\n' "$https_mode"
+        printf '  🧩 Remnawave API:   %s/tcp — только %s\n' "$node_port" "$panel_ip"
+    else
+        printf '  IPv6:             %s\n  IP-списки:         %s\n' "$ipv6" "$blocklists"
+        ((${#restricted_rules[@]} == 0)) || printf '  Ограничение:       %s\n' "${restricted_rules[@]}"
+    fi
     warn "Будет включён единый nftables-firewall. Все неразрешённые входящие и Docker-порты будут закрыты."
+    warn "Проверьте правила существующего firewall и firewall у хостинга. Правила других nftables-таблиц сохраняются."
+    if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status | grep -q '^Status: active'; then
+        ufw_active=yes
+        confirm "UFW активен. Разрешить его отключение после применения выбранных правил?" || return 0
+    fi
+    if systemctl is-active --quiet firewalld; then
+        error "Активен firewalld. Сначала согласуйте переход на ServerTool; правила не изменены."; return 1
+    fi
     confirm "Продолжить?" || { warn "Отменено."; return 0; }
 
     backup=$(make_backup firewall)
@@ -383,41 +917,65 @@ configure_firewall() {
     cp -a /etc/ufw "$backup/" 2>/dev/null || true
     ufw status numbered > "$backup/ufw-status.txt" 2>&1 || true
 
-    write_guard_config "$ssh_port" "$node_port" "$panel_ip" "$https_mode" || return 1
-    install_guard_runtime
-
-    # The new firewall is already active. Now remove UFW without flushing unrelated nftables tables.
-    if command -v ufw >/dev/null 2>&1; then
-        ufw --force disable >/dev/null 2>&1 || true
-        systemctl disable --now ufw.service >/dev/null 2>&1 || true
-        run_apt purge -y ufw >/dev/null || warn "UFW отключён, но пакет не удалось удалить."
-        "$GUARD_UPDATER" --apply
+    prepare_firewall_rollback "$backup" "$ufw_active" || return 1
+    rollback_unit="server-tool-rollback-$(date +%s)-$$"
+    systemd-run --quiet --unit="$rollback_unit" --on-active=5min --timer-property=AccuracySec=1s \
+        /bin/bash "$backup/rollback.sh" || { error "Не удалось запланировать откат; правила не изменены."; return 1; }
+    systemctl stop server-tool-guard.timer server-tool-guard-update.service 2>/dev/null || true
+    if ! write_guard_config "$ssh_port" "$node_port" "$panel_ip" "$https_mode" \
+        "$tcp_ports" "$udp_ports" "$ssh_sources" "$ipv6" "$blocklists" "${restricted_rules[@]}" ||
+        ! install_guard_runtime ||
+        { [[ $ufw_active == yes ]] && ! ufw --force disable; }; then
+        bash "$backup/rollback.sh" || error "Автооткат не завершён; используйте консоль хостинга и ${backup}."
+        systemctl stop "$rollback_unit.timer" || true
+        return 1
+    fi
+    warn "Откат запланирован через 5 минут. Проверьте новый SSH-вход и нужные сервисы из другого окна."
+    if ! read -r -t 120 -p "Введите yes, чтобы сохранить firewall (ожидание 120 с): " answer ||
+        [[ $answer != yes ]] || [[ -e $backup/rollback-started ]]; then
+        bash "$backup/rollback.sh" || error "Откат не завершён. Резервная копия: ${backup}"
+        systemctl stop "$rollback_unit.timer" || true
+        warn "Новые правила не подтверждены; выполнен откат."
+        return 1
+    fi
+    systemctl stop "$rollback_unit.timer" || { error "Не удалось отменить откат."; return 1; }
+    systemctl enable --now server-tool-guard.timer >/dev/null || return 1
+    if [[ $blocklists == yes ]]; then
+        "$GUARD_UPDATER" --refresh || warn "IP-списки не обновлены; используются кэшированные правила."
     fi
 
     success "Firewall настроен. Резервная копия: ${backup}"
     printf '\n'; nft list table inet server_tool_guard
-    log INFO "firewall configured ssh=${ssh_port} https=${https_mode} node=${node_port} panel=${panel_ip}"
+    log INFO "firewall configured role=${SERVER_ROLE} ssh=${ssh_port} https=${https_mode} node=${node_port} panel=${panel_ip}"
 }
 
 write_guard_config() {
     local ssh_port="$1" node_port="$2" panel_ip="$3" https_mode="$4" geo_countries=""
-    local tcp_ports udp_ports
-    tcp_ports=$(read_guard_extra_ports tcp) || { error "Некорректный список дополнительных TCP-портов."; return 1; }
-    udp_ports=$(read_guard_extra_ports udp) || { error "Некорректный список дополнительных UDP-портов."; return 1; }
-    validate_guard_extra_ports "$tcp_ports" "$udp_ports" "$node_port" "$ssh_port" || return 1
-    if [[ -r $GUARD_CONFIG ]]; then
+    local tcp_ports udp_ports ssh_sources="${7:-}" ipv6="${8:-no}" blocklists="${9:-yes}"
+    if (($# >= 6)); then
+        tcp_ports=$5; udp_ports=$6
+    else
+        tcp_ports=$(read_guard_extra_ports tcp) || return 1
+        udp_ports=$(read_guard_extra_ports udp) || return 1
+    fi
+    validate_guard_extra_ports "$tcp_ports" "$udp_ports" "$node_port" "$ssh_port" "$SERVER_ROLE" || return 1
+    if [[ -r $GUARD_CONFIG && $(read_guard_setting SERVER_ROLE node) == "$SERVER_ROLE" ]]; then
         geo_countries=$(awk -F= '$1 == "GEO_COUNTRIES" {gsub(/"/, "", $2); print $2; exit}' "$GUARD_CONFIG")
     fi
-    mkdir -p "$CONFIG_DIR"
-    cat > "$GUARD_CONFIG" <<EOF
+    mkdir -p "$CONFIG_DIR" || return 1
+    cat > "$GUARD_CONFIG" <<EOF || return 1
 # Managed by ServerTool. Shell syntax; root-writable only.
+SERVER_ROLE="${SERVER_ROLE}"
 SSH_PORT="${ssh_port}"
+SSH_SOURCES="${ssh_sources}"
+ENABLE_IPV6="${ipv6}"
 NODE_PORT="${node_port}"
 PANEL_IPV4="${panel_ip}"
 HTTPS_MODE="${https_mode}"
-# Additional public IPv4 ports. SSH, NODE_PORT and 443 are managed separately.
+# Public ports; IPv6 is controlled by ENABLE_IPV6.
 EXTRA_TCP_PORTS="${tcp_ports}"
 EXTRA_UDP_PORTS="${udp_ports}"
+BLOCKLIST_ENABLED="${blocklists}"
 BLOCKLIST_URLS=(
   "https://cdn.jsdelivr.net/gh/shadow-netlab/traffic-guard-lists@main/public/antiscanner.list"
   "https://cdn.jsdelivr.net/gh/shadow-netlab/traffic-guard-lists@main/public/government_networks.list"
@@ -425,6 +983,11 @@ BLOCKLIST_URLS=(
 # Optional ISO 3166-1 alpha-2 country codes, separated by spaces.
 GEO_COUNTRIES="${geo_countries}"
 EOF
+    printf 'RESTRICTED_RULES=(\n' >> "$GUARD_CONFIG" || return 1
+    if (($# >= 10)); then
+        printf '  %q\n' "${@:10}" >> "$GUARD_CONFIG" || return 1
+    fi
+    printf ')\n' >> "$GUARD_CONFIG" || return 1
     chmod 600 "$GUARD_CONFIG"
 }
 
@@ -436,28 +999,88 @@ set -Eeuo pipefail
 umask 077
 GUARD_HEADER
     printf 'CONFIG=%q\n' "$config" >> "$target" || return 1
-    declare -f valid_port normalize_guard_ports validate_guard_extra_ports >> "$target" || return 1
+    declare -f valid_port normalize_guard_ports validate_guard_extra_ports normalize_ip_sources normalize_access_rules >> "$target" || return 1
     cat >> "$target" <<'GUARD_SCRIPT'
 TABLE=server_tool_guard
 CACHE=/var/lib/server-tool/blocklist-v4.txt
 [[ -r $CONFIG ]] || { echo "Missing $CONFIG" >&2; exit 1; }
+SERVER_ROLE=node
+ENABLE_IPV6=no
+BLOCKLIST_ENABLED=yes
+SSH_SOURCES=""
+RESTRICTED_RULES=()
 # shellcheck disable=SC1090
 source "$CONFIG"
-[[ ${SSH_PORT:-} =~ ^[0-9]+$ ]] && ((SSH_PORT >= 1 && SSH_PORT <= 65535)) || exit 1
-[[ ${NODE_PORT:-} =~ ^[0-9]+$ ]] && ((NODE_PORT >= 1 && NODE_PORT <= 65535)) || exit 1
+valid_port "${SSH_PORT:-}" || exit 1
+SSH_PORT=$((10#$SSH_PORT))
+[[ $SERVER_ROLE == node || $SERVER_ROLE == server ]] || exit 1
+[[ $ENABLE_IPV6 == yes || $ENABLE_IPV6 == no ]] || exit 1
+[[ $BLOCKLIST_ENABLED == yes || $BLOCKLIST_ENABLED == no ]] || exit 1
 [[ ${HTTPS_MODE:-} =~ ^(both|tcp|udp|none)$ ]] || exit 1
 EXTRA_TCP_PORTS=$(normalize_guard_ports "${EXTRA_TCP_PORTS:-}") || { echo 'Invalid EXTRA_TCP_PORTS' >&2; exit 1; }
 EXTRA_UDP_PORTS=$(normalize_guard_ports "${EXTRA_UDP_PORTS:-}") || { echo 'Invalid EXTRA_UDP_PORTS' >&2; exit 1; }
-validate_guard_extra_ports "$EXTRA_TCP_PORTS" "$EXTRA_UDP_PORTS" "$NODE_PORT" "$SSH_PORT" || exit 1
-python3 - "$PANEL_IPV4" <<'PY' >/dev/null
+SSH_SOURCES=$(normalize_ip_sources "$SSH_SOURCES") || exit 1
+rules=$(normalize_access_rules "${RESTRICTED_RULES[@]}") || exit 1
+if [[ $SERVER_ROLE == node ]]; then
+    valid_port "${NODE_PORT:-}" || exit 1
+    NODE_PORT=$((10#$NODE_PORT))
+    python3 - "$PANEL_IPV4" <<'PY' >/dev/null
 import ipaddress, sys
 n = ipaddress.ip_network(sys.argv[1], strict=False)
 assert n.version == 4
 PY
+else
+    [[ $HTTPS_MODE == none ]] || { echo 'Use public port lists for the server profile' >&2; exit 1; }
+fi
+validate_guard_extra_ports "$EXTRA_TCP_PORTS" "$EXTRA_UDP_PORTS" "${NODE_PORT:-}" "$SSH_PORT" "$SERVER_ROLE" || exit 1
+if [[ $ENABLE_IPV6 == no && $SSH_SOURCES == *:* ]]; then
+    echo 'IPv6 SSH sources require ENABLE_IPV6=yes' >&2; exit 1
+fi
+while IFS='|' read -r protocol port source; do
+    [[ -n $protocol ]] || continue
+    validate_guard_extra_ports "$port" "" "${NODE_PORT:-}" "$SSH_PORT" "$SERVER_ROLE" || exit 1
+    public_ports=$EXTRA_TCP_PORTS
+    [[ $protocol != udp ]] || public_ports=$EXTRA_UDP_PORTS
+    [[ " $public_ports " != *" $port "* ]] || { echo "Port $port/$protocol cannot be public and restricted" >&2; exit 1; }
+    [[ $ENABLE_IPV6 == yes || $source != *:* ]] || { echo 'IPv6 access rules require ENABLE_IPV6=yes' >&2; exit 1; }
+done <<< "$rules"
+
+emit_ssh_rules() {
+    local source family
+    if [[ -z $SSH_SOURCES ]]; then
+        printf '    meta nfproto ipv4 tcp dport %s counter accept\n' "$SSH_PORT"
+        [[ $ENABLE_IPV6 != yes ]] || printf '    meta nfproto ipv6 tcp dport %s counter accept\n' "$SSH_PORT"
+    else
+        local -a sources=()
+        IFS=' ' read -r -a sources <<< "$SSH_SOURCES"
+        for source in "${sources[@]}"; do
+            family=ip
+            [[ $source != *:* ]] || family=ip6
+            printf '    %s saddr %s tcp dport %s counter accept\n' "$family" "$source" "$SSH_PORT"
+        done
+    fi
+}
+
+emit_access_rules() {
+    local chain="$1" protocol port source family
+    while IFS='|' read -r protocol port source; do
+        [[ -n $protocol ]] || continue
+        family=ip
+        [[ $source != *:* ]] || family=ip6
+        if [[ $chain == forward ]]; then
+            printf '    %s saddr %s meta l4proto %s ct original proto-dst %s counter accept\n' "$family" "$source" "$protocol" "$port"
+        else
+            printf '    %s saddr %s %s dport %s counter accept\n' "$family" "$source" "$protocol" "$port"
+        fi
+    done <<< "$rules"
+}
+
+public_family='meta nfproto ipv4'
+[[ $ENABLE_IPV6 != yes ]] || public_family=''
 mkdir -p /var/lib/server-tool
 work=$(mktemp -d /run/server-tool-guard.XXXXXX)
 trap 'rm -rf "$work"' EXIT
-if [[ ${1:---apply} == --refresh ]]; then
+if [[ ${1:---apply} == --refresh && $BLOCKLIST_ENABLED == yes ]]; then
     : > "$work/raw"
     downloaded=0
     expected=${#BLOCKLIST_URLS[@]}
@@ -518,6 +1141,7 @@ PY
 fi
 touch "$CACHE"
 count=$(wc -l < "$CACHE")
+[[ $BLOCKLIST_ENABLED != no ]] || count=0
 {
     nft list table inet "$TABLE" >/dev/null 2>&1 && echo "delete table inet $TABLE"
     cat <<EOF
@@ -534,11 +1158,17 @@ EOF
     fi
     cat <<EOF
   }
+EOF
+    if [[ $SERVER_ROLE == node ]]; then
+        cat <<EOF
   set panel_v4 {
     type ipv4_addr
     flags interval
     elements = { $PANEL_IPV4 }
   }
+EOF
+    fi
+    cat <<EOF
   set extra_tcp_ports {
     type inet_service
 EOF
@@ -561,12 +1191,21 @@ EOF
     meta l4proto ipv6-icmp counter accept
     meta nfproto ipv4 ip protocol icmp limit rate 10/second counter accept
     meta nfproto ipv4 udp sport 67 udp dport 68 counter accept
-    meta nfproto ipv4 ip saddr @panel_v4 tcp dport $NODE_PORT counter accept
-    meta nfproto ipv4 ip saddr @blocked_v4 counter drop
-    meta nfproto ipv4 tcp dport $SSH_PORT counter accept
-    meta nfproto ipv4 tcp dport @extra_tcp_ports counter accept
-    meta nfproto ipv4 udp dport @extra_udp_ports counter accept
 EOF
+    [[ $ENABLE_IPV6 != yes ]] || echo '    meta nfproto ipv6 udp sport 547 udp dport 546 counter accept'
+    if [[ $SERVER_ROLE == node ]]; then
+        echo "    meta nfproto ipv4 ip saddr @panel_v4 tcp dport $NODE_PORT counter accept"
+    else
+        # Explicit SSH access must survive third-party IP-list updates.
+        emit_ssh_rules
+    fi
+    cat <<EOF
+    meta nfproto ipv4 ip saddr @blocked_v4 counter drop
+EOF
+    [[ $SERVER_ROLE != node ]] || emit_ssh_rules
+    emit_access_rules input
+    printf '    %s tcp dport @extra_tcp_ports counter accept\n' "$public_family"
+    printf '    %s udp dport @extra_udp_ports counter accept\n' "$public_family"
     case "$HTTPS_MODE" in
         both) echo '    meta nfproto ipv4 tcp dport 443 counter accept'; echo '    meta nfproto ipv4 udp dport 443 counter accept' ;;
         tcp)  echo '    meta nfproto ipv4 tcp dport 443 counter accept' ;;
@@ -578,20 +1217,27 @@ EOF
   chain forward {
     type filter hook forward priority -20; policy accept;
     ct state invalid counter drop
-    meta nfproto ipv4 ip saddr @panel_v4 meta l4proto tcp ct original proto-dst $NODE_PORT counter accept
+EOF
+    if [[ $SERVER_ROLE == node ]]; then
+        echo "    meta nfproto ipv4 ip saddr @panel_v4 meta l4proto tcp ct original proto-dst $NODE_PORT counter accept"
+    fi
+    cat <<EOF
     ip saddr @blocked_v4 counter drop
     ct state established,related counter accept
     iifname "docker0" counter accept
     iifname "br-*" counter accept
-    meta l4proto tcp ct original proto-dst $NODE_PORT counter drop
-    tcp dport $NODE_PORT counter drop
-    meta nfproto ipv4 meta l4proto tcp ct original proto-dst @extra_tcp_ports counter accept
-    meta nfproto ipv4 meta l4proto udp ct original proto-dst @extra_udp_ports counter accept
 EOF
+    if [[ $SERVER_ROLE == node ]]; then
+        echo "    meta l4proto tcp ct original proto-dst $NODE_PORT counter drop"
+        echo "    tcp dport $NODE_PORT counter drop"
+    fi
+    emit_access_rules forward
+    printf '    %s meta l4proto tcp ct original proto-dst @extra_tcp_ports counter accept\n' "$public_family"
+    printf '    %s meta l4proto udp ct original proto-dst @extra_udp_ports counter accept\n' "$public_family"
     case "$HTTPS_MODE" in
-        both) echo '    meta l4proto tcp ct original proto-dst 443 counter accept'; echo '    meta l4proto udp ct original proto-dst 443 counter accept' ;;
-        tcp)  echo '    meta l4proto tcp ct original proto-dst 443 counter accept' ;;
-        udp)  echo '    meta l4proto udp ct original proto-dst 443 counter accept' ;;
+        both) echo '    meta nfproto ipv4 meta l4proto tcp ct original proto-dst 443 counter accept'; echo '    meta nfproto ipv4 meta l4proto udp ct original proto-dst 443 counter accept' ;;
+        tcp)  echo '    meta nfproto ipv4 meta l4proto tcp ct original proto-dst 443 counter accept' ;;
+        udp)  echo '    meta nfproto ipv4 meta l4proto udp ct original proto-dst 443 counter accept' ;;
     esac
     cat <<EOF
     ct status dnat counter drop
@@ -610,13 +1256,13 @@ GUARD_SCRIPT
 }
 
 install_guard_runtime() {
-    mkdir -p "$CONFIG_DIR"
-    [[ -f $GUARD_CONFIG ]] || write_guard_config "$(detect_ssh_port)" "$DEFAULT_NODE_PORT" "$DEFAULT_PANEL_IP" both || return 1
+    mkdir -p "$CONFIG_DIR" || return 1
+    [[ -f $GUARD_CONFIG ]] || { error "Сначала настройте firewall."; return 1; }
     write_guard_updater || return 1
-    chmod 750 "$GUARD_UPDATER"
-    cat > "$GUARD_SERVICE" <<EOF
+    chmod 750 "$GUARD_UPDATER" || return 1
+    cat > "$GUARD_SERVICE" <<EOF || return 1
 [Unit]
-Description=ServerTool nftables firewall for Remnawave
+Description=ServerTool nftables firewall
 After=local-fs.target
 Before=docker.service
 
@@ -628,7 +1274,7 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-    cat > "$GUARD_UPDATE_SERVICE" <<EOF
+    cat > "$GUARD_UPDATE_SERVICE" <<EOF || return 1
 [Unit]
 Description=Refresh ServerTool nftables blocklists
 Wants=network-online.target
@@ -639,7 +1285,7 @@ Type=oneshot
 ExecStart=${GUARD_UPDATER} --refresh
 TimeoutStartSec=3min
 EOF
-    cat > "$GUARD_TIMER" <<EOF
+    cat > "$GUARD_TIMER" <<EOF || return 1
 [Unit]
 Description=Update ServerTool nftables blocklists daily
 
@@ -653,18 +1299,10 @@ Unit=server-tool-guard-update.service
 [Install]
 WantedBy=timers.target
 EOF
-    systemctl daemon-reload
-    systemctl enable server-tool-guard.service server-tool-guard.timer >/dev/null
-    if "$GUARD_UPDATER" --refresh; then
-        systemctl restart server-tool-guard.service >/dev/null
-        systemctl enable --now server-tool-guard.timer >/dev/null
-        success "Единый nftables-firewall активен; списки обновляются ежедневно."
-    else
-        "$GUARD_UPDATER" --apply
-        systemctl restart server-tool-guard.service >/dev/null
-        systemctl enable --now server-tool-guard.timer >/dev/null
-        warn "Firewall активен с кэшированным/пустым списком; сетевые списки обновятся позже."
-    fi
+    systemctl daemon-reload || return 1
+    systemctl enable server-tool-guard.service server-tool-guard.timer >/dev/null || return 1
+    "$GUARD_UPDATER" --check || return 1
+    systemctl restart server-tool-guard.service
 }
 
 edit_guard_port_list() {
@@ -685,7 +1323,7 @@ edit_guard_port_list() {
 
 change_guard_port() (
     local action="$1" protocol="$2" port="$3" backup
-    local EXTRA_TCP_PORTS="" EXTRA_UDP_PORTS="" SSH_PORT="" NODE_PORT=""
+    local EXTRA_TCP_PORTS="" EXTRA_UDP_PORTS="" SSH_PORT="" NODE_PORT="" SERVER_ROLE=node
     require_root
     [[ $action == add || $action == remove ]] || return 1
     [[ $protocol == tcp || $protocol == udp || $protocol == both ]] || return 1
@@ -696,8 +1334,12 @@ change_guard_port() (
     }
     # shellcheck disable=SC1090
     source "$GUARD_CONFIG"
-    valid_port "$SSH_PORT" && valid_port "$NODE_PORT" || { error "Некорректные основные порты в guard.conf."; return 1; }
-    validate_guard_extra_ports "$port" "" "$NODE_PORT" "$SSH_PORT" || return 1
+    valid_port "$SSH_PORT" || { error "Некорректный SSH-порт в guard.conf."; return 1; }
+    [[ $SERVER_ROLE == node || $SERVER_ROLE == server ]] || return 1
+    if [[ $SERVER_ROLE == node ]]; then
+        valid_port "$NODE_PORT" || { error "Некорректный API-порт в guard.conf."; return 1; }
+    fi
+    validate_guard_extra_ports "$port" "" "$NODE_PORT" "$SSH_PORT" "$SERVER_ROLE" || return 1
     EXTRA_TCP_PORTS=$(normalize_guard_ports "$EXTRA_TCP_PORTS") || return 1
     EXTRA_UDP_PORTS=$(normalize_guard_ports "$EXTRA_UDP_PORTS") || return 1
     if [[ $protocol == tcp || $protocol == both ]]; then
@@ -706,7 +1348,7 @@ change_guard_port() (
     if [[ $protocol == udp || $protocol == both ]]; then
         EXTRA_UDP_PORTS=$(edit_guard_port_list "$EXTRA_UDP_PORTS" "$action" "$port") || return 1
     fi
-    validate_guard_extra_ports "$EXTRA_TCP_PORTS" "$EXTRA_UDP_PORTS" "$NODE_PORT" "$SSH_PORT" || return 1
+    validate_guard_extra_ports "$EXTRA_TCP_PORTS" "$EXTRA_UDP_PORTS" "$NODE_PORT" "$SSH_PORT" "$SERVER_ROLE" || return 1
 
     mkdir -p "$BACKUP_ROOT" || return 1
     backup=$(mktemp -d "${BACKUP_ROOT}/ports.XXXXXX") || return 1
@@ -768,7 +1410,7 @@ guard_ports_menu() {
             3) protocol=both ;;
             *) error "Некорректный протокол."; continue ;;
         esac
-        warn "Разрешение действует для всех IPv4-адресов, включая Docker-публикации. IP-блокировки сохраняются."
+        warn "Разрешение публичное, включая Docker-публикации. Семейства IP и IP-блокировки берутся из guard.conf."
         confirm "$verb ${port}/${protocol}?" || continue
         if ! change_guard_port "$action" "$protocol" "$port"; then
             error "Изменение порта не выполнено."
@@ -817,6 +1459,14 @@ guard_menu() {
                     error "Используйте двухбуквенные коды стран через пробел."
                 else
                     sed -Ei "s/^GEO_COUNTRIES=.*/GEO_COUNTRIES=\"${countries,,}\"/" "$GUARD_CONFIG"
+                    if [[ -n $countries ]]; then
+                        warn "Geo-block включает также базовые внешние IP-списки."
+                        if grep -q '^BLOCKLIST_ENABLED=' "$GUARD_CONFIG"; then
+                            sed -i 's/^BLOCKLIST_ENABLED=.*/BLOCKLIST_ENABLED="yes"/' "$GUARD_CONFIG"
+                        else
+                            printf '\nBLOCKLIST_ENABLED="yes"\n' >> "$GUARD_CONFIG"
+                        fi
+                    fi
                     "$GUARD_UPDATER" --refresh
                 fi
                 pause
@@ -1015,7 +1665,38 @@ EOF
 configure_crowdsec_acquisition() {
     mkdir -p /etc/crowdsec/acquis.d
 
+    local container="$REMNAWAVE_NGINX_CONTAINER" choice
+    if [[ $SERVER_ROLE == server ]]; then
+        printf '\nИсточники CrowdSec:\n  1) Только базовая защита Linux/SSH\n  2) Nginx на хосте (/var/log/nginx/*.log)\n  3) Nginx в Docker (указать контейнер)\n'
+        read -r -p "Выбор [1]: " choice || return 1
+        case "${choice:-1}" in
+            1)
+                rm -f "$CROWDSEC_ACQUIS"
+                info "Выбрана базовая защита Linux/SSH. Конфигурации других источников CrowdSec сохранены."
+                return 0
+                ;;
+            2)
+                [[ -d /var/log/nginx ]] || { error "Каталог /var/log/nginx не найден."; return 1; }
+                cat > "$CROWDSEC_ACQUIS" <<'EOF'
+# Managed by ServerTool
+filenames:
+  - /var/log/nginx/*.log
+labels:
+  type: nginx
+EOF
+                success "Подключены журналы Nginx на хосте."
+                return 0
+                ;;
+            3)
+                read -r -p "Точное имя Nginx-контейнера: " container || return 1
+                [[ $container =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { error "Некорректное имя контейнера."; return 1; }
+                ;;
+            *) error "Неизвестный пункт."; return 1 ;;
+        esac
+    fi
+
     if ! command -v docker >/dev/null 2>&1; then
+        [[ $SERVER_ROLE != server ]] || { error "Docker не найден; источники не изменены."; return 1; }
         rm -f "$CROWDSEC_ACQUIS"
         warn "Docker не найден. SSH будет защищён; Nginx можно подключить позже."
         return 0
@@ -1025,21 +1706,25 @@ configure_crowdsec_acquisition() {
     #   remnawave-nginx — Nginx
     #   remnanode       — контейнер ноды
     # Никакого поиска по шаблонам: проверяем точное имя контейнера через inspect.
-    if ! docker container inspect "$REMNAWAVE_NGINX_CONTAINER" >/dev/null 2>&1; then
+    if ! docker container inspect "$container" >/dev/null 2>&1; then
+        [[ $SERVER_ROLE != server ]] || { error "Контейнер ${container} не найден; источники не изменены."; return 1; }
         rm -f "$CROWDSEC_ACQUIS"
         warn "Контейнер ${REMNAWAVE_NGINX_CONTAINER} не найден. SSH будет защищён; Nginx можно подключить позже."
         return 0
     fi
 
     cat > "$CROWDSEC_ACQUIS" <<EOF
+# Managed by ServerTool
 source: docker
 container_name:
-  - ${REMNAWAVE_NGINX_CONTAINER}
+  - ${container}
 labels:
   type: nginx
 EOF
 
-    success "Подключены Docker-логи Nginx: ${REMNAWAVE_NGINX_CONTAINER}"
+    success "Подключены Docker-логи Nginx: ${container}"
+
+    [[ $SERVER_ROLE == node ]] || return 0
 
     if docker container inspect "$REMNANODE_CONTAINER" >/dev/null 2>&1; then
         info "Контейнер ноды найден: ${REMNANODE_CONTAINER}"
@@ -1063,13 +1748,17 @@ wait_for_crowdsec_lapi() {
 
 write_crowdsec_bouncer_override() {
     local lapi_port="$1" api_key="$2" bouncer_local="${3:-$CROWDSEC_BOUNCER_LOCAL}"
+    local disable_ipv6=true enable_ipv6=false
+    if [[ $SERVER_ROLE == server ]]; then
+        disable_ipv6=false; enable_ipv6=true
+    fi
 
     cat > "$bouncer_local" <<EOF
 ${CROWDSEC_MANAGED_MARKER}
 api_url: http://127.0.0.1:${lapi_port}/
 api_key: "${api_key}"
 mode: nftables
-disable_ipv6: true
+disable_ipv6: ${disable_ipv6}
 nftables:
   ipv4:
     enabled: true
@@ -1077,7 +1766,10 @@ nftables:
     table: crowdsec
     chain: crowdsec-chain
   ipv6:
-    enabled: false
+    enabled: ${enable_ipv6}
+    set-only: false
+    table: crowdsec6
+    chain: crowdsec6-chain
 nftables_hooks:
   - input
   - forward
@@ -1109,7 +1801,7 @@ configure_crowdsec_bouncer() {
 
 install_crowdsec() {
     require_root
-    ensure_packages curl gpg ca-certificates apt-transport-https python3 iproute2
+    ensure_packages curl gpg ca-certificates apt-transport-https python3 iproute2 || return 1
     local key_tmp collection candidate policy lapi_port
     crowdsec_installed && warn "CrowdSec уже установлен; пакет и конфигурация будут обновлены."
     step "Подключение официального репозитория CrowdSec"
@@ -1146,7 +1838,7 @@ EOF
     for collection in crowdsecurity/linux crowdsecurity/sshd crowdsecurity/nginx; do
         cscli collections install "$collection" >/dev/null 2>&1 || true
     done
-    configure_crowdsec_acquisition
+    configure_crowdsec_acquisition || return 1
     # Versions <=3.0.13 created a separate forward hook. The current bouncer
     # supports input and forward hooks natively, so remove the legacy helper.
     rm -f "$CROWDSEC_FORWARD"
@@ -1223,7 +1915,7 @@ crowdsec_menu() {
             warn "CrowdSec не активен"
         fi
         printf '\n  1) Установить/обновить CrowdSec\n'
-        printf '  2) Подключить заново Nginx-контейнер\n'
+        printf '  2) Настроить источники журналов Linux/SSH/Nginx\n'
         printf '  3) Показать метрики и решения\n'
         printf '  4) Удалить CrowdSec\n'
         printf '  0) Назад\n\n'
@@ -1232,8 +1924,9 @@ crowdsec_menu() {
             1) install_crowdsec; pause ;;
             2)
                 crowdsec_installed || { error "Сначала установите CrowdSec."; pause; continue; }
-                configure_crowdsec_acquisition
-                systemctl restart crowdsec
+                if configure_crowdsec_acquisition; then
+                    systemctl restart crowdsec
+                fi
                 pause
                 ;;
             3)
@@ -1554,17 +2247,20 @@ EOF
 
 show_status() {
     clear 2>/dev/null || true
-    printf '%b📊 СОСТОЯНИЕ НОДЫ%b\n\n' "$BOLD" "$NC"
+    printf '%b📊 СОСТОЯНИЕ СЕРВЕРА%b\n\n' "$BOLD" "$NC"
+    printf 'Профиль:     %s\n' "$(profile_label)"
     printf 'ОС:          %s\n' "$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-unknown}")"
     printf 'Ядро:        %s\n' "$(uname -r)"
     printf 'SSH-порт:    %s/tcp\n' "$(detect_ssh_port)"
     printf 'BBR:         %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 'unknown')"
     if nft list table inet server_tool_guard >/dev/null 2>&1; then
         printf 'nft firewall: активен\n'
+        printf 'Профиль FW:  %s\n' "$(read_guard_setting SERVER_ROLE node)"
         systemctl list-timers server-tool-guard.timer --no-pager 2>/dev/null || true
     else
         printf 'nft firewall: не активен\n'
     fi
+    show_disk_usage
     if crowdsec_installed && systemctl is-active --quiet crowdsec; then
         printf 'CrowdSec:    активен\n'
     else
@@ -1574,24 +2270,46 @@ show_status() {
 }
 
 full_setup() {
-    warn "Мастер последовательно предложит обновление, SSH, nftables, CrowdSec, XanMod и BBR."
+    local profile
+    profile=$(choose_server_profile) || return 0
+    printf '\nВыбран профиль: %s\n' "$(profile_label "$profile")"
+    info "Шаги: проверка диска, ручная очистка по выбору, обновление, SSH, firewall, CrowdSec и BBR по выбору."
+    if [[ $profile == node ]]; then
+        info "Для ноды также будет предложен XanMod."
+    else
+        info "Порты задаются вручную. Docker, веб-сервер, базы и приложения мастер не устанавливает."
+    fi
     confirm "Запустить полный мастер?" || return 0
-    confirm "Обновить систему сейчас?" Y && system_update
+    mkdir -p "$CONFIG_DIR"
+    [[ ! -L $PROFILE_FILE ]] || { error "Файл профиля не должен быть символической ссылкой."; return 1; }
+    printf '%s\n' "$profile" > "$PROFILE_FILE"
+    chmod 600 "$PROFILE_FILE"
+    SERVER_ROLE=$profile
+    show_disk_usage
+    if ! package_disk_ready; then
+        cleanup_menu
+        package_disk_ready || return 1
+    elif confirm "Открыть ручную очистку перед настройкой?"; then
+        cleanup_menu
+    fi
+    if confirm "Обновить систему сейчас?" Y; then system_update; fi
     info "Сначала добавьте/создайте ключ, затем настройте порт SSH."
-    ssh_menu
-    configure_firewall
-    confirm "Установить CrowdSec?" && install_crowdsec
-    confirm "Установить XanMod?" && install_xanmod
-    confirm "Включить BBR?" Y && configure_bbr
+    if confirm "Открыть настройки SSH?" Y; then ssh_menu; fi
+    if confirm "Настроить firewall?" Y; then configure_firewall; fi
+    if confirm "Установить CrowdSec?"; then install_crowdsec; fi
+    if [[ $SERVER_ROLE == node ]] && confirm "Установить XanMod?"; then install_xanmod; fi
+    if confirm "Включить BBR на текущем ядре?"; then configure_bbr; fi
     success "Мастер завершён. Проверьте статус и новый SSH-вход до выхода из текущей сессии."
 }
 
 show_help() {
     cat <<EOF
-${APP_NAME} ${APP_VERSION} — настройка и защита Remnawave-ноды
+${APP_NAME} ${APP_VERSION} — настройка, защита и ручная очистка Ubuntu/Debian
 
 Использование:
   sudo bash server_tool.sh          интерактивное меню
+                                   пункт 1: нода или универсальный сервер
+                                   пункт 11: ручная очистка сервера
   sudo bash server_tool.sh --status состояние сервера
   bash server_tool.sh --version     версия
   bash server_tool.sh --help        справка
@@ -1603,11 +2321,12 @@ show_menu() {
     while true; do
         clear 2>/dev/null || true
         printf '%b╔══════════════════════════════════════════╗%b\n' "$CYAN" "$NC"
-        printf '%b║  🚀 ServerTool %-7s • Remnawave Node  ║%b\n' "$CYAN" "v${APP_VERSION}" "$NC"
+        printf '%b║  🚀 ServerTool %-7s                  ║%b\n' "$CYAN" "v${APP_VERSION}" "$NC"
         printf '%b╚══════════════════════════════════════════╝%b\n\n' "$CYAN" "$NC"
-        printf '  1) 🧰 Полная рекомендуемая настройка\n'
+        printf '  Профиль: %s\n\n' "$(profile_label)"
+        printf '  1) 🧰 Полная настройка: нода / универсальный сервер\n'
         printf '  2) 🔄 Обновить систему\n'
-        printf '  3) 🔥 Настроить nftables и порты ноды\n'
+        printf '  3) 🔥 Настроить nftables и порты выбранного профиля\n'
         printf '  4) 🔑 Настроить SSH\n'
         printf '  5) 🛡️  Firewall, Anti-Scanner и Geo-block\n'
         printf '  6) 🕵️  CrowdSec\n'
@@ -1615,11 +2334,12 @@ show_menu() {
         printf '  8) 🚄 Включить BBR\n'
         printf '  9) 📊 Показать состояние\n'
         printf ' 10) 🔓 Дополнительные TCP/UDP-порты\n'
+        printf ' 11) 🧹 Очистка сервера и диагностика диска\n'
         printf '  0) 👋 Выход\n\n'
-        read -r -p "Выберите пункт: " choice || true
+        read -r -p "Выберите пункт: " choice || return 0
         case $choice in
             1) full_setup; pause ;;
-            2) system_update; pause ;;
+            2) system_update || error "Обновление не завершено."; pause ;;
             3) configure_firewall; pause ;;
             4) ssh_menu ;;
             5) guard_menu ;;
@@ -1628,6 +2348,7 @@ show_menu() {
             8) configure_bbr; pause ;;
             9) show_status; pause ;;
             10) guard_ports_menu ;;
+            11) cleanup_menu ;;
             0) success "Готово. Не забудьте проверить новый SSH-вход."; return ;;
             *) warn "Неизвестный пункт."; sleep 1 ;;
         esac
@@ -1638,12 +2359,13 @@ main() {
     case "${1:-}" in
         -h|--help) show_help; return ;;
         -v|--version) printf '%s %s\n' "$APP_NAME" "$APP_VERSION"; return ;;
-        --status) require_root; require_supported_os; show_status; return ;;
+        --status) require_root; require_supported_os; load_server_profile; show_status; return ;;
         "") ;;
         *) show_help; return 2 ;;
     esac
     require_root
     require_supported_os
+    load_server_profile
     mkdir -p "$BACKUP_ROOT"
     touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
     log INFO "ServerTool ${APP_VERSION} started"

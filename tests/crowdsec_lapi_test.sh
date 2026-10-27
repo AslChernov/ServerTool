@@ -2,8 +2,9 @@
 
 set -Eeuo pipefail
 
-readonly TEST_DIR=$(cd -- "${BASH_SOURCE[0]%/*}" && pwd)
-readonly REPO_ROOT=$(cd -- "${TEST_DIR}/.." && pwd)
+TEST_DIR=$(cd -- "${BASH_SOURCE[0]%/*}" && pwd)
+REPO_ROOT=$(cd -- "${TEST_DIR}/.." && pwd)
+readonly TEST_DIR REPO_ROOT
 
 # Sourcing the script is safe because its main entry point is guarded.
 # shellcheck disable=SC1091

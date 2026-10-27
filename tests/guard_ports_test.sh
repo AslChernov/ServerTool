@@ -56,7 +56,7 @@ nft() {
         *) return 1 ;;
     esac
 }
-curl() { return 22; } # Refresh tests must never access the network.
+curl() { printf 'called\n' >> "$NFT_TEST_DIR/curl-calls"; return 22; }
 export -f nft curl
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -135,4 +135,35 @@ done
 base_config
 guard_ports_menu <<< $'1\n8443\n1\ny\n\n0' >/dev/null
 equal 8443 "$(read_guard_extra_ports tcp)" 'menu opens TCP 8443'
+
+export SERVER_ROLE=server
+write_guard_config 34464 '' '' none '80 443' '443' '192.0.2.10 2001:db8::10' yes no \
+    'tcp|9090|192.0.2.0/24' 'tcp|9090|2001:db8:1::/48'
+write_guard_updater
+: > "$work/curl-calls"
+bash "$GUARD_UPDATER" --refresh
+[[ ! -s $work/curl-calls ]] || fail 'disabled server blocklists were downloaded'
+if grep -Eq 'panel_v4|dport 2222' "$work/applied.nft"; then fail 'server profile contains node API rules'; fi
+grep -Fq 'ip saddr 192.0.2.10/32 tcp dport 34464 counter accept' "$work/applied.nft" || fail 'restricted IPv4 SSH missing'
+grep -Fq 'ip6 saddr 2001:db8::10/128 tcp dport 34464 counter accept' "$work/applied.nft" || fail 'restricted IPv6 SSH missing'
+if grep -Fq 'meta nfproto ipv4 tcp dport 34464 counter accept' "$work/applied.nft"; then fail 'SSH restriction bypassed'; fi
+grep -Eq '^ +tcp dport @extra_tcp_ports counter accept$' "$work/applied.nft" || fail 'dual-stack public TCP rule missing'
+grep -Fq 'ip6 saddr 2001:db8:1::/48 meta l4proto tcp ct original proto-dst 9090 counter accept' "$work/applied.nft" || fail 'restricted IPv6 Docker rule missing'
+before=$(< "$GUARD_CONFIG")
+if change_guard_port add tcp 9090 >/dev/null 2>&1; then fail 'restricted port became public'; fi
+equal "$before" "$(< "$GUARD_CONFIG")" 'access-conflict rejection restores config'
+change_guard_port add tcp 2222
+equal '80 443 2222' "$(read_guard_extra_ports tcp)" 'universal profile does not reserve node API port'
+
+for bad_rule in 'tcp|34464|192.0.2.1' 'tcp|80|192.0.2.1' 'icmp|9000|192.0.2.1' 'tcp|9000|192.0.2.1; flush ruleset'; do
+    write_guard_config 34464 '' '' none '80 443' '' '' yes no "$bad_rule"
+    if bash "$GUARD_UPDATER" --check >/dev/null 2>&1; then fail "accepted unsafe access rule: $bad_rule"; fi
+done
+write_guard_config 34464 '' '' none '' '' '2001:db8::10' no no
+if bash "$GUARD_UPDATER" --check >/dev/null 2>&1; then fail 'IPv6 SSH allowed with IPv6 disabled'; fi
+
+base_config
+bash "$GUARD_UPDATER" --check
+grep -Fq 'ip saddr @panel_v4 tcp dport 2222 counter accept' "$work/checked.nft" || fail 'legacy config inherited caller server role'
 printf 'PASS: custom ports, legacy configs, menu, persistence, rule ordering and rollback\n'
+printf 'PASS: universal profile, IPv6, restricted access, disabled feeds and invalid rules\n'
