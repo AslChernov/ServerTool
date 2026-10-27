@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly APP_VERSION="3.2.1"
+readonly APP_VERSION="3.2.2"
 readonly APP_NAME="ServerTool"
 readonly APT_LOCK_TIMEOUT=300
 readonly APT_LOCK_RETRY_DELAY=5
@@ -2168,7 +2168,8 @@ detect_psabi() {
 
 download_xanmod_file() {
     local url="$1" target="$2" status
-    local -a options=(--fail --silent --show-error --location --connect-timeout 10 --max-time 30 --retry 1 --retry-delay 1)
+    # XanMod can reject curl's default User-Agent while allowing APT requests.
+    local -a options=(--user-agent 'Debian APT-HTTP/1.3' --fail --silent --show-error --location --connect-timeout 10 --max-time 30 --retry 1 --retry-delay 1)
     if curl "${options[@]}" "$url" -o "$target"; then
         return 0
     else

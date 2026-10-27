@@ -35,10 +35,11 @@ reset_fixture() {
     : > "$XANMOD_TEST_DIR/apt-calls"
 }
 curl() {
-    local url="" target="" ipv4=no
+    local url="" target="" ipv4=no agent=""
     while (($#)); do
         case "$1" in
             --ipv4) ipv4=yes ;;
+            --user-agent) shift; agent=$1 ;;
             -o) shift; target=$1 ;;
             https://*) url=$1 ;;
         esac
@@ -46,6 +47,10 @@ curl() {
     done
     [[ -n $url && -n $target ]] || fail 'invalid curl arguments'
     printf '%s|%s\n' "$ipv4" "$url" >> "$XANMOD_TEST_DIR/curl-calls"
+    if [[ $agent != 'Debian APT-HTTP/1.3' ]]; then
+        printf 'curl: (22) HTTP 403: default download client rejected\n' >&2
+        return 22
+    fi
     if [[ $url == */Release ]]; then
         case "$TEST_MODE" in
             network_failure) printf 'curl: (28) Connection timed out\n' >&2; return 28 ;;
@@ -53,6 +58,7 @@ curl() {
                 if [[ $ipv4 == no ]]; then printf 'curl: (7) Failed to connect\n' >&2; return 7; fi
                 ;;
             http_404) printf 'curl: (22) HTTP 404\n' >&2; return 22 ;;
+            http_403) printf 'curl: (22) HTTP 403\n' >&2; return 22 ;;
             invalid_metadata) printf '<html>not a repository</html>\n' > "$target"; return 0 ;;
         esac
         printf 'Codename: resolute\nArchitectures: amd64\n' > "$target"
@@ -113,7 +119,7 @@ install_xanmod <<< $'1\ny' >/dev/null 2>&1
 grep -Fqx 'yes|https://deb.xanmod.org/dists/resolute/Release' "$XANMOD_TEST_DIR/curl-calls" || fail 'IPv4 fallback missing'
 grep -Fqx 'install -y linux-xanmod-lts-x64v3' "$XANMOD_TEST_DIR/apt-calls" || fail 'LTS branch was not installed'
 
-for TEST_MODE in network_failure http_404 invalid_metadata invalid_key update_failure no_candidate; do
+for TEST_MODE in network_failure http_404 http_403 invalid_metadata invalid_key update_failure no_candidate; do
     reset_fixture
     if output=$(install_xanmod <<< $'2\ny' 2>&1); then fail "accepted $TEST_MODE"; fi
     [[ $(< "$XANMOD_KEYRING") == 'old key' ]] || fail "$TEST_MODE changed the previous key"
@@ -122,8 +128,8 @@ for TEST_MODE in network_failure http_404 invalid_metadata invalid_key update_fa
     if [[ $TEST_MODE == network_failure ]]; then
         [[ $(wc -l < "$XANMOD_TEST_DIR/curl-calls") == 2 ]] || fail 'unbounded network retries'
         [[ $output == *'Connection timed out'* && $output != *'не публикует репозиторий'* ]] || fail 'network failure misreported as unsupported release'
-    elif [[ $TEST_MODE == http_404 ]]; then
-        [[ $(wc -l < "$XANMOD_TEST_DIR/curl-calls") == 1 ]] || fail 'HTTP 404 incorrectly retried as an IPv6 error'
+    elif [[ $TEST_MODE == http_404 || $TEST_MODE == http_403 ]]; then
+        [[ $(wc -l < "$XANMOD_TEST_DIR/curl-calls") == 1 ]] || fail "$TEST_MODE incorrectly retried as an IPv6 error"
     fi
 done
 
@@ -162,4 +168,4 @@ full_setup <<< 1 >/dev/null
 clear() { :; }
 pause() { :; }
 show_menu <<< $'7\n0' >/dev/null
-printf 'PASS: resolute metadata, IPv4 fallback, diagnostics, key verification, repo rollback and optional XanMod failure\n'
+printf 'PASS: APT User-Agent, HTTP 403/404, resolute metadata, IPv4 fallback, key verification, repo rollback and optional XanMod failure\n'
