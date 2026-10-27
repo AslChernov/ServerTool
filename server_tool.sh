@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly APP_VERSION="3.2.0"
+readonly APP_VERSION="3.2.1"
 readonly APP_NAME="ServerTool"
 readonly APT_LOCK_TIMEOUT=300
 readonly APT_LOCK_RETRY_DELAY=5
@@ -28,6 +28,8 @@ readonly CROWDSEC_CONFIG_LOCAL="/etc/crowdsec/config.yaml.local"
 readonly CROWDSEC_LAPI_CREDENTIALS_LOCAL="/etc/crowdsec/local_api_credentials.yaml.local"
 readonly CROWDSEC_LAPI_PORT_FILE="${CONFIG_DIR}/crowdsec-lapi-port"
 readonly CROWDSEC_MANAGED_MARKER="# Managed by ServerTool"
+readonly XANMOD_SOURCE="/etc/apt/sources.list.d/xanmod-release.list"
+readonly XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
 readonly DEFAULT_PANEL_IP="45.148.62.18"
 readonly DEFAULT_NODE_PORT="2222"
 readonly REMNAWAVE_NGINX_CONTAINER="remnawave-nginx"
@@ -2164,16 +2166,36 @@ detect_psabi() {
     printf 'v2\n'
 }
 
-install_xanmod() {
+download_xanmod_file() {
+    local url="$1" target="$2" status
+    local -a options=(--fail --silent --show-error --location --connect-timeout 10 --max-time 30 --retry 1 --retry-delay 1)
+    if curl "${options[@]}" "$url" -o "$target"; then
+        return 0
+    else
+        status=$?
+    fi
+    case "$status" in
+        5|6|7|28|35|52|56)
+            warn "Сетевая ошибка curl (${status}); повтор загрузки XanMod только через IPv4."
+            curl --ipv4 "${options[@]}" "$url" -o "$target"
+            ;;
+        *) return "$status" ;;
+    esac
+}
+
+install_xanmod() (
     require_root
     [[ $(dpkg --print-architecture) == amd64 ]] || { error "XanMod поддерживается этим скриптом только на amd64."; return 1; }
-    ensure_packages wget gpg ca-certificates lsb-release
-    local codename level branch package key_tmp
-    codename=$(lsb_release -sc)
+    package_disk_ready || return 1
+    ensure_packages curl gpg ca-certificates lsb-release || return 1
+    local codename level branch package work fingerprint policy candidate
+    local repo=https://deb.xanmod.org repo_changed=no repo_ready=no had_key=no had_source=no cleanup_status restore_failed=no
+    codename=$(lsb_release -sc) || return 1
+    [[ $codename =~ ^[a-z][a-z0-9-]*$ ]] || { error "Некорректное кодовое имя системы."; return 1; }
     level=$(detect_psabi)
     info "Кодовое имя системы: ${codename}; рекомендуемый psABI: x86-64-${level}."
     printf '\nВетка XanMod:\n  1) LTS (рекомендуется для VPN-ноды)\n  2) Main\n  0) Отмена\n'
-    read -r -p "Выбор [1]: " branch || true
+    read -r -p "Выбор [1]: " branch || return 0
     branch=${branch:-1}
     case $branch in
         1) package="linux-xanmod-lts-x64${level}" ;;
@@ -2181,43 +2203,76 @@ install_xanmod() {
         0) return 0 ;;
         *) error "Неизвестный вариант."; return 1 ;;
     esac
-    if ! wget -qO /dev/null "http://deb.xanmod.org/dists/${codename}/Release"; then
-        error "XanMod не публикует репозиторий для ${codename}. Настройки APT не изменены."
+    work=$(mktemp -d) || return 1
+    trap '
+        cleanup_status=$?
+        if [[ $repo_changed == yes && $repo_ready == no ]]; then
+            if [[ $had_key == yes ]]; then
+                cp -p -- "$work/previous-keyring" "$XANMOD_KEYRING" || { cleanup_status=1; restore_failed=yes; }
+            else
+                rm -f -- "$XANMOD_KEYRING" || { cleanup_status=1; restore_failed=yes; }
+            fi
+            if [[ $had_source == yes ]]; then
+                cp -p -- "$work/previous-source" "$XANMOD_SOURCE" || { cleanup_status=1; restore_failed=yes; }
+            else
+                rm -f -- "$XANMOD_SOURCE" || { cleanup_status=1; restore_failed=yes; }
+            fi
+            if [[ $restore_failed == no ]]; then
+                warn "Предыдущие файлы репозитория XanMod восстановлены."
+            else
+                error "Не удалось полностью восстановить репозиторий XanMod. Копии файлов сохранены в ${work}."
+            fi
+        fi
+        [[ $restore_failed != no ]] || rm -rf -- "$work"
+        exit "$cleanup_status"
+    ' EXIT
+    info "Проверка ${repo}/dists/${codename}/Release"
+    if ! download_xanmod_file "${repo}/dists/${codename}/Release" "$work/Release"; then
+        error "Не удалось загрузить метаданные XanMod для ${codename}; причина указана curl выше. Это не доказывает отсутствие поддержки выпуска. Настройки APT не изменены."
+        return 1
+    fi
+    if ! grep -Fxq "Codename: ${codename}" "$work/Release"; then
+        error "Ответ сервера не содержит ожидаемых метаданных для ${codename}. Настройки APT не изменены."
         return 1
     fi
     warn "Сторонние DKMS-модули могут быть несовместимы с новым ядром."
     confirm "Добавить официальный репозиторий и установить ${package}?" || return 0
-    key_tmp=$(mktemp)
-    wget -qO "$key_tmp" https://dl.xanmod.org/archive.key
-    install -d -m 0755 /etc/apt/keyrings
-    gpg --batch --yes --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg "$key_tmp"
-    rm -f "$key_tmp"
-
-    # ServerTool uses umask 027. APT downloads repository metadata as the
-    # unprivileged _apt user, so keyrings referenced by signed-by must remain
-    # world-readable. Otherwise APT reports NO_PUBKEY even when the right key
-    # was imported successfully.
-    chmod 0644 /etc/apt/keyrings/xanmod-archive-keyring.gpg
-
-    local xanmod_fingerprint
-    xanmod_fingerprint=$(gpg --batch --show-keys --with-colons \
-        /etc/apt/keyrings/xanmod-archive-keyring.gpg 2>/dev/null \
-        | awk -F: '$1 == "fpr" {print $10; exit}')
-    if [[ $xanmod_fingerprint != D38D7D1DA1349567ADED882D86F7D09EE734E623 ]]; then
-        rm -f /etc/apt/keyrings/xanmod-archive-keyring.gpg
+    download_xanmod_file https://dl.xanmod.org/archive.key "$work/archive.key" || return 1
+    gpg --batch --yes --dearmor -o "$work/keyring.gpg" "$work/archive.key" || return 1
+    fingerprint=$(gpg --batch --show-keys --with-colons "$work/keyring.gpg" 2>/dev/null \
+        | awk -F: '$1 == "fpr" {print $10; exit}') || return 1
+    if [[ $fingerprint != D38D7D1DA1349567ADED882D86F7D09EE734E623 ]]; then
         error "Отпечаток ключа XanMod не совпал с официальным. Репозиторий не добавлен."
         return 1
     fi
-
-    printf 'deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org %s main\n' "$codename" \
-        > /etc/apt/sources.list.d/xanmod-release.list
-    chmod 0644 /etc/apt/sources.list.d/xanmod-release.list
-    run_apt update
-    run_apt install -y "$package"
+    [[ ! -L $XANMOD_SOURCE && ! -L $XANMOD_KEYRING ]] || { error "Файлы XanMod не должны быть символическими ссылками."; return 1; }
+    if [[ -e $XANMOD_KEYRING ]]; then
+        cp -p -- "$XANMOD_KEYRING" "$work/previous-keyring" || return 1
+        had_key=yes
+    fi
+    if [[ -e $XANMOD_SOURCE ]]; then
+        cp -p -- "$XANMOD_SOURCE" "$work/previous-source" || return 1
+        had_source=yes
+    fi
+    printf 'deb [signed-by=%s] %s %s main\n' "$XANMOD_KEYRING" "$repo" "$codename" > "$work/source.list" || return 1
+    install -d -m 0755 "${XANMOD_KEYRING%/*}" "${XANMOD_SOURCE%/*}" || return 1
+    repo_changed=yes
+    # APT reads public keyrings and sources as the unprivileged _apt user.
+    install -m 0644 "$work/keyring.gpg" "$XANMOD_KEYRING" || return 1
+    install -m 0644 "$work/source.list" "$XANMOD_SOURCE" || return 1
+    run_apt update --error-on=any || return 1
+    policy=$(apt-cache policy "$package") || return 1
+    candidate=$(awk '$1 == "Candidate:" {print $2; exit}' <<< "$policy")
+    [[ -n $candidate && $candidate != '(none)' ]] || {
+        error "Пакет ${package} недоступен для ${codename}; выберите другую ветку или оставьте текущее ядро."; return 1;
+    }
+    # Keep a verified repository after an interrupted install so APT can repair it.
+    repo_ready=yes
+    run_apt install -y "$package" || return 1
     success "${package} установлен. Перезагрузитесь, когда будет удобно."
     printf 'Текущее ядро: %s\n' "$(uname -r)"
     log INFO "xanmod installed package=${package}"
-}
+)
 
 configure_bbr() {
     require_root
@@ -2297,7 +2352,9 @@ full_setup() {
     if confirm "Открыть настройки SSH?" Y; then ssh_menu; fi
     if confirm "Настроить firewall?" Y; then configure_firewall; fi
     if confirm "Установить CrowdSec?"; then install_crowdsec; fi
-    if [[ $SERVER_ROLE == node ]] && confirm "Установить XanMod?"; then install_xanmod; fi
+    if [[ $SERVER_ROLE == node ]] && confirm "Установить XanMod?"; then
+        install_xanmod || warn "XanMod не установлен. Остальные настройки сохранены; мастер продолжает работу."
+    fi
     if confirm "Включить BBR на текущем ядре?"; then configure_bbr; fi
     success "Мастер завершён. Проверьте статус и новый SSH-вход до выхода из текущей сессии."
 }
@@ -2344,7 +2401,7 @@ show_menu() {
             4) ssh_menu ;;
             5) guard_menu ;;
             6) crowdsec_menu ;;
-            7) install_xanmod; pause ;;
+            7) install_xanmod || warn "Установка XanMod не завершена; можно повторить её позже."; pause ;;
             8) configure_bbr; pause ;;
             9) show_status; pause ;;
             10) guard_ports_menu ;;

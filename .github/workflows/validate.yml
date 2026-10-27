@@ -53,6 +53,7 @@ jobs:
           bash tests/run_apt_test.sh
           bash tests/server_profile_test.sh
           bash tests/cleanup_test.sh
+          bash tests/xanmod_test.sh
       - name: Smoke-test OS detection and status
         run: sudo bash server_tool.sh --status
       - name: Smoke-test SSH runtime directory recovery
