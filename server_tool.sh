@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly APP_VERSION="3.2.3"
+readonly APP_VERSION="3.2.4"
 readonly APP_NAME="ServerTool"
 readonly APT_LOCK_TIMEOUT=300
 readonly APT_LOCK_RETRY_DELAY=5
@@ -249,12 +249,18 @@ report_dpkg_state() {
 prepare_dpkg_recovery_context() {
     local failed_output="$1" lapi_port crowdsec_failed=no
 
+    # Audit/manual recovery may have no APT error log; also check the dpkg database.
     if grep -Eqi \
         'dpkg: error processing package (crowdsec|crowdsec-firewall-bouncer)|installed (crowdsec|crowdsec-firewall-bouncer).*script.*error' \
         "$failed_output"; then
         crowdsec_failed=yes
     elif sed -n '/^Errors were encountered while processing:/,$p' "$failed_output" | \
         grep -Eqi '(^|[[:space:]/])(crowdsec|crowdsec-firewall-bouncer)([[:space:]:/]|$)'; then
+        crowdsec_failed=yes
+    elif dpkg-query -W -f='${binary:Package}\t${db:Status-Abbrev}\n' 2>/dev/null | \
+        awk '$1 ~ /^crowdsec(:|$)|^crowdsec-firewall-bouncer([:-]|$)/ &&
+             (substr($2, 2, 1) ~ /[UFHWt]/ || substr($2, 3, 1) == "R") {pending = 1}
+             END {exit !pending}'; then
         crowdsec_failed=yes
     fi
 

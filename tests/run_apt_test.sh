@@ -15,12 +15,14 @@ trap 'rm -rf "$work"' EXIT
 
 export APT_TEST_COUNT_FILE="${work}/count"
 export DPKG_TEST_COUNT_FILE="${work}/dpkg-count"
+export DPKG_TEST_PREP_COUNT_FILE="${work}/dpkg-prep-count"
 export CROWDSEC_PREP_COUNT_FILE="${work}/crowdsec-prep-count"
 export CROWDSEC_SYNC_COUNT_FILE="${work}/crowdsec-sync-count"
 export CROWDSEC_WAIT_COUNT_FILE="${work}/crowdsec-wait-count"
 export CLEAN_TEST_COUNT_FILE="${work}/clean-count"
 APT_TEST_MODE=
 APT_TEST_CONFIRM=no
+DPKG_TEST_PACKAGES=""
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
@@ -30,6 +32,7 @@ fail() {
 reset_calls() {
     printf '0\n' > "$APT_TEST_COUNT_FILE"
     printf '0\n' > "$DPKG_TEST_COUNT_FILE"
+    printf '0\n' > "$DPKG_TEST_PREP_COUNT_FILE"
     printf '0\n' > "$CROWDSEC_PREP_COUNT_FILE"
     printf '0\n' > "$CROWDSEC_SYNC_COUNT_FILE"
     printf '0\n' > "$CROWDSEC_WAIT_COUNT_FILE"
@@ -106,12 +109,16 @@ apt-get() {
 }
 
 dpkg() {
-    local count
+    local count prepared
+    read -r prepared < "$CROWDSEC_PREP_COUNT_FILE"
+    printf '%s\n' "$prepared" > "$DPKG_TEST_PREP_COUNT_FILE"
     read -r count < "$DPKG_TEST_COUNT_FILE"
     count=$((count + 1))
     printf '%s\n' "$count" > "$DPKG_TEST_COUNT_FILE"
     [[ $APT_TEST_MODE != persistent_dpkg_error ]]
 }
+
+dpkg-query() { printf '%s' "$DPKG_TEST_PACKAGES"; }
 
 systemctl() { :; }
 package_disk_ready() { :; }
@@ -175,6 +182,7 @@ fi
 [[ $(call_count) == 1 ]] || fail 'non-lock APT error was retried'
 
 APT_TEST_MODE=dpkg_then_success
+DPKG_TEST_PACKAGES=$'crowdsec\tii \nbroken-package\tiF \n'
 reset_calls
 recovery_output=$(run_apt full-upgrade -y 2>&1) || fail 'recoverable dpkg error was not repaired'
 [[ $(call_count) == 3 ]] || fail 'dpkg recovery did not run fix-broken and retry the original command'
@@ -183,6 +191,7 @@ read -r dpkg_count < "$DPKG_TEST_COUNT_FILE"
 [[ $recovery_output == *'Состояние APT/dpkg восстановлено'* ]] || fail 'dpkg recovery success was not shown'
 read -r crowdsec_prep_count < "$CROWDSEC_PREP_COUNT_FILE"
 [[ $crowdsec_prep_count == 0 ]] || fail 'unrelated package failure incorrectly triggered CrowdSec recovery'
+DPKG_TEST_PACKAGES=""
 
 APT_TEST_MODE=crowdsec_dpkg_then_success
 reset_calls
@@ -193,6 +202,17 @@ read -r crowdsec_sync_count < "$CROWDSEC_SYNC_COUNT_FILE"
 [[ $crowdsec_sync_count == 1 ]] || fail 'CrowdSec bouncer URL was not synchronized exactly once'
 read -r crowdsec_wait_count < "$CROWDSEC_WAIT_COUNT_FILE"
 [[ $crowdsec_wait_count == 1 ]] || fail 'CrowdSec LAPI readiness was not checked exactly once'
+
+APT_TEST_MODE=success
+for pending_package in $'crowdsec\tiF ' $'crowdsec:amd64\thF ' $'crowdsec-firewall-bouncer-nftables\tiU '; do
+    DPKG_TEST_PACKAGES="${pending_package}"$'\n'
+    reset_calls
+    recover_dpkg_state /dev/null >/dev/null 2>&1 || fail 'pending CrowdSec recovery without an APT error log failed'
+    read -r prepared < "$DPKG_TEST_PREP_COUNT_FILE"
+    [[ $prepared == 1 ]] || fail 'pending CrowdSec was not prepared before dpkg --configure --pending'
+    [[ $(call_count) == 1 ]] || fail 'pending CrowdSec recovery did not run fix-broken exactly once'
+done
+DPKG_TEST_PACKAGES=""
 
 APT_TEST_MODE=persistent_dpkg_error
 reset_calls
