@@ -16,6 +16,7 @@ trap 'rm -rf "$work"' EXIT
 export APT_TEST_COUNT_FILE="${work}/count"
 export DPKG_TEST_COUNT_FILE="${work}/dpkg-count"
 export DPKG_TEST_PREP_COUNT_FILE="${work}/dpkg-prep-count"
+export APT_TEST_GODEBUG_FILE="${work}/apt-godebug"
 export CROWDSEC_PREP_COUNT_FILE="${work}/crowdsec-prep-count"
 export CROWDSEC_SYNC_COUNT_FILE="${work}/crowdsec-sync-count"
 export CROWDSEC_WAIT_COUNT_FILE="${work}/crowdsec-wait-count"
@@ -23,6 +24,7 @@ export CLEAN_TEST_COUNT_FILE="${work}/clean-count"
 APT_TEST_MODE=
 APT_TEST_CONFIRM=no
 DPKG_TEST_PACKAGES=""
+DPKG_TEST_ERROR=""
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
@@ -37,6 +39,7 @@ reset_calls() {
     printf '0\n' > "$CROWDSEC_SYNC_COUNT_FILE"
     printf '0\n' > "$CROWDSEC_WAIT_COUNT_FILE"
     printf '0\n' > "$CLEAN_TEST_COUNT_FILE"
+    : > "$APT_TEST_GODEBUG_FILE"
 }
 
 call_count() {
@@ -55,6 +58,7 @@ apt-get() {
     count=$(call_count)
     count=$((count + 1))
     printf '%s\n' "$count" > "$APT_TEST_COUNT_FILE"
+    printf '%s\n' "${GODEBUG:-}" >> "$APT_TEST_GODEBUG_FILE"
 
     case "$APT_TEST_MODE" in
         success)
@@ -93,6 +97,17 @@ apt-get() {
                 'E: Sub-process /usr/bin/dpkg returned an error code (1)' >&2
             return 100
             ;;
+        crowdsec_tls_then_success|persistent_crowdsec_tls_error)
+            if [[ $APT_TEST_MODE == persistent_crowdsec_tls_error ]] ||
+                { [[ ${1:-} == --fix-broken ]] && [[ ${GODEBUG:-} != *tlsmlkem=0 ]]; } ||
+                { ((count == 1)) && [[ ${1:-} != --fix-broken ]]; }; then
+                printf '%s\n' "$DPKG_TEST_ERROR" \
+                    'dpkg: error processing package crowdsec (--configure):' \
+                    'E: Sub-process /usr/bin/dpkg returned an error code (1)' >&2
+                return 100
+            fi
+            printf 'APT completed after TLS compatibility retry\n'
+            ;;
         space_then_success|space_warning_then_success|persistent_space_error)
             if ((count == 1)) || [[ $APT_TEST_MODE == persistent_space_error ]]; then
                 printf '%s\n' 'E: Write error - write (28: No space left on device)' \
@@ -115,6 +130,10 @@ dpkg() {
     read -r count < "$DPKG_TEST_COUNT_FILE"
     count=$((count + 1))
     printf '%s\n' "$count" > "$DPKG_TEST_COUNT_FILE"
+    if [[ -n $DPKG_TEST_ERROR ]]; then
+        printf '%s\n' "$DPKG_TEST_ERROR" >&2
+        return 1
+    fi
     [[ $APT_TEST_MODE != persistent_dpkg_error ]]
 }
 
@@ -213,6 +232,57 @@ for pending_package in $'crowdsec\tiF ' $'crowdsec:amd64\thF ' $'crowdsec-firewa
     [[ $(call_count) == 1 ]] || fail 'pending CrowdSec recovery did not run fix-broken exactly once'
 done
 DPKG_TEST_PACKAGES=""
+
+(
+    GODEBUG='http2debug=0,tlsmlkem=1'
+    DPKG_TEST_PACKAGES=$'crowdsec\tiF \n'
+    APT_TEST_MODE=crowdsec_tls_then_success
+    for tls_host in hub-data.crowdsec.net cdn-hub.crowdsec.net version.crowdsec.net; do
+        DPKG_TEST_ERROR="Error: cscli hub upgrade: Get \"https://${tls_host}/file\": net/http: TLS handshake timeout"
+        reset_calls
+        recover_dpkg_state /dev/null >/dev/null 2>&1 || fail "TLS compatibility recovery failed for $tls_host"
+        read -r used_godebug < "$APT_TEST_GODEBUG_FILE"
+        [[ $used_godebug == 'http2debug=0,tlsmlkem=1,tlsmlkem=0' ]] || fail 'TLS fallback did not preserve existing GODEBUG options'
+        [[ $(call_count) == 1 ]] || fail 'TLS fallback added an unnecessary APT retry'
+        [[ $GODEBUG == 'http2debug=0,tlsmlkem=1' ]] || fail 'TLS fallback leaked into the calling shell'
+    done
+
+    reset_calls
+    run_apt full-upgrade -y >/dev/null 2>&1 || fail 'APT-triggered CrowdSec TLS recovery failed'
+    mapfile -t used_godebug < "$APT_TEST_GODEBUG_FILE"
+    [[ ${#used_godebug[@]} == 3 ]] || fail 'APT TLS recovery did not retry the original command exactly once'
+    [[ ${used_godebug[0]} == "$GODEBUG" && ${used_godebug[2]} == "$GODEBUG" ]] || fail 'TLS compatibility escaped the fix-broken retry'
+    [[ ${used_godebug[1]} == "$GODEBUG,tlsmlkem=0" ]] || fail 'fix-broken did not receive the TLS compatibility override'
+
+    APT_TEST_MODE=persistent_crowdsec_tls_error
+    reset_calls
+    if run_apt full-upgrade -y >/dev/null 2>&1; then
+        fail 'persistent CrowdSec TLS failure was hidden'
+    else
+        status=$?
+    fi
+    [[ $status == 100 && $(call_count) == 2 ]] || fail 'persistent TLS failure changed status or caused a retry loop'
+
+    APT_TEST_MODE=success
+    for tls_error in \
+        'Get "https://example.com/file": net/http: TLS handshake timeout' \
+        'Get "https://hub-data.crowdsec.net.evil.test/file": net/http: TLS handshake timeout' \
+        'Get "https://hub-data.crowdsec.net/file": x509: certificate signed by unknown authority'; do
+        DPKG_TEST_ERROR="$tls_error"
+        reset_calls
+        recover_dpkg_state /dev/null >/dev/null 2>&1 || fail 'ordinary dpkg recovery failed'
+        read -r used_godebug < "$APT_TEST_GODEBUG_FILE"
+        [[ $used_godebug == "$GODEBUG" ]] || fail 'TLS fallback was applied to an unrelated timeout or certificate error'
+    done
+
+    unset GODEBUG
+    APT_TEST_MODE=crowdsec_tls_then_success
+    DPKG_TEST_ERROR='Get "https://hub-data.crowdsec.net/file": net/http: TLS handshake timeout'
+    reset_calls
+    recover_dpkg_state /dev/null >/dev/null 2>&1 || fail 'TLS recovery with unset GODEBUG failed'
+    read -r used_godebug < "$APT_TEST_GODEBUG_FILE"
+    [[ $used_godebug == tlsmlkem=0 && ${GODEBUG+x} != x ]] || fail 'TLS fallback with unset GODEBUG leaked or had a malformed value'
+)
 
 APT_TEST_MODE=persistent_dpkg_error
 reset_calls

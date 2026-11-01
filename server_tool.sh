@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly APP_VERSION="3.2.4"
+readonly APP_VERSION="3.2.5"
 readonly APP_NAME="ServerTool"
 readonly APT_LOCK_TIMEOUT=300
 readonly APT_LOCK_RETRY_DELAY=5
@@ -296,6 +296,7 @@ prepare_dpkg_recovery_context() {
 
 recover_dpkg_state() {
     local failed_output="$1" output_file status fix_status
+    local fix_godebug="${GODEBUG:-}"
     local -a pipe_status
     package_disk_ready || return 1
     warn "dpkg не завершил настройку пакетов. Выполняется одна попытка штатного восстановления."
@@ -310,10 +311,15 @@ recover_dpkg_state() {
         ((status != 0)) || status=${pipe_status[1]:-1}
         log_package_failure "dpkg --configure --pending" "$output_file"
         warn "dpkg --configure --pending не завершился успешно; APT попробует исправить зависимости."
+        # A larger Go ML-KEM ClientHello can time out on incompatible middleboxes.
+        if grep -Eqi 'https://(hub-data|cdn-hub|version)\.crowdsec\.net/.*TLS handshake timeout' "$output_file"; then
+            fix_godebug="${fix_godebug:+$fix_godebug,}tlsmlkem=0"
+            warn "TLS handshake timeout CrowdSec: один повтор APT без ML-KEM только для этой команды. Проверка сертификатов сохранена."
+        fi
     fi
     rm -f "$output_file"
 
-    if APT_DPKG_RECOVERY_ACTIVE=1 run_apt --fix-broken install -y; then
+    if GODEBUG="$fix_godebug" APT_DPKG_RECOVERY_ACTIVE=1 run_apt --fix-broken install -y; then
         success "Состояние APT/dpkg восстановлено."
         return 0
     else
