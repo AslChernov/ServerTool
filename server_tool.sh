@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly APP_VERSION="3.2.2"
+readonly APP_VERSION="3.2.3"
 readonly APP_NAME="ServerTool"
 readonly APT_LOCK_TIMEOUT=300
 readonly APT_LOCK_RETRY_DELAY=5
@@ -1554,6 +1554,8 @@ write_crowdsec_lapi_overrides() {
 
     cat > "$config_local" <<EOF
 ${CROWDSEC_MANAGED_MARKER}
+cscli:
+  hub_branch: master
 api:
   server:
     listen_uri: 127.0.0.1:${port}

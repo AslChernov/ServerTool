@@ -57,6 +57,7 @@ config_local="${work}/config.yaml.local"
 credentials_local="${work}/local_api_credentials.yaml.local"
 write_crowdsec_lapi_overrides 18080 "$config_local" "$credentials_local"
 grep -Fqx "$CROWDSEC_MANAGED_MARKER" "$config_local" || fail 'config marker is missing'
+grep -Fqx '  hub_branch: master' "$config_local" || fail 'fixed Hub branch is missing'
 grep -Fqx '    listen_uri: 127.0.0.1:18080' "$config_local" || fail 'LAPI listen URI is wrong'
 grep -Fqx 'url: http://127.0.0.1:18080/' "$credentials_local" || fail 'LAPI client URL is wrong'
 
