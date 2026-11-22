@@ -104,3 +104,41 @@ FAIL_INSTALL=yes
 if configure_firewall <<< $'80 443\n\n-\nn\n\nn\ny' >/dev/null 2>&1; then fail 'failed firewall installation accepted'; fi
 [[ $(< "$GUARD_CONFIG") == "$before" ]] || fail 'failed installation did not restore previous config'
 printf 'PASS: wizard profiles, persistence, SSH-only CrowdSec and idempotent firewall rollback\n'
+
+curl() {
+    [[ ${*: -1:1} == 'https://tech.cdn.yandex.net/prefixes/yc.json' ]] || return 22
+    printf '%s\n' "${MOCK_CDN_JSON}"
+}
+MOCK_CDN_JSON='{"prefixes":["8.8.8.0/25","8.8.8.128/25","2001:4860::/32"]}'
+[[ $(node_client_sources yandex-cdn) == '8.8.8.0/24' ]] || fail 'Yandex import must collapse IPv4 and exclude IPv6'
+for MOCK_CDN_JSON in '{"prefixes":[]}' '{"prefixes":["0.0.0.0/0"]}' broken; do
+    if node_client_sources yandex-cdn >/dev/null 2>&1; then fail 'accepted invalid or unsafe Yandex list'; fi
+done
+MOCK_CDN_JSON='{"prefixes":["8.8.8.0/25"]}'
+SERVER_ROLE=node
+FAIL_INSTALL=no
+cat > "$GUARD_CONFIG" <<'EOF'
+SERVER_ROLE=node
+SSH_PORT=34464
+NODE_PORT=2222
+PANEL_IPV4=192.0.2.3
+HTTPS_MODE=both
+EXTRA_TCP_PORTS=8443
+EOF
+configure_firewall <<< $'2\n\n\nyandex-cdn\n192.0.2.4\n8443\ntcp\n192.0.2.5\n\ny\nyes' >/dev/null 2>&1
+grep -Fqx 'NODE_CLIENT_SOURCES="8.8.8.0/25"' "$GUARD_CONFIG" || fail 'wizard did not save Yandex CIDRs'
+grep -Fqx 'PANEL_IPV4="192.0.2.3"' "$GUARD_CONFIG" || fail 'wizard replaced the existing panel IP'
+grep -Fqx 'EXTRA_TCP_PORTS=""' "$GUARD_CONFIG" || fail 'wizard left the restricted port public'
+grep -Fq '8443' "$GUARD_CONFIG" || fail 'wizard did not save the restricted port'
+grep -Fqx 'SSH_SOURCES="192.0.2.4/32"' "$GUARD_CONFIG" || fail 'wizard did not restrict SSH'
+read_main_menu <<< 12 > "$work/menu"
+[[ $MENU_CHOICE == 12 ]] || fail 'non-interactive menu number was lost'
+grep -Fq 'Диагностика ноды' "$work/menu" || fail 'new menu items missing'
+if command -v realpath >/dev/null 2>&1; then
+    mkdir "$work/web"
+    printf 'previous page\n' > "$work/web/index.html"
+    install_node_template <<< $'3\n'"$work/web"$'\ny' >/dev/null
+    grep -Fq 'name="color-scheme" content="dark"' "$work/web/index.html" || fail 'dark template did not install'
+    grep -Fqx 'previous page' "$BACKUP_ROOT"/*-template.*/index.html || fail 'old index was not preserved'
+fi
+printf 'PASS: Yandex CDN validation, node wizard access controls and numeric menu\n'

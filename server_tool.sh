@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 027
 
-readonly APP_VERSION="3.2.5"
+readonly APP_VERSION="3.3.0"
 readonly APP_NAME="ServerTool"
 readonly APT_LOCK_TIMEOUT=300
 readonly APT_LOCK_RETRY_DELAY=5
@@ -176,6 +176,25 @@ try:
 except ValueError as exc:
     raise SystemExit(f"Некорректный IP/CIDR: {exc}")
 PY
+}
+
+node_client_sources() {
+    if [[ $1 != yandex-cdn ]]; then
+        normalize_ip_sources "$1"
+        return
+    fi
+    curl -fsSL --proto '=https' --proto-redir '=https' --max-time 20 --max-filesize 1048576 \
+        'https://tech.cdn.yandex.net/prefixes/yc.json' | python3 -c '
+import ipaddress, json, sys
+prefixes = json.load(sys.stdin)["prefixes"]
+if not isinstance(prefixes, list):
+    raise SystemExit("Invalid Yandex CDN prefix list")
+networks = [ipaddress.ip_network(value) for value in prefixes]
+ipv4 = [net for net in networks if net.version == 4]
+if not ipv4 or any(not net.is_global or net.is_multicast or net.prefixlen < 16 for net in ipv4):
+    raise SystemExit("Invalid Yandex CDN IPv4 prefix list")
+print(" ".join(map(str, ipaddress.collapse_addresses(ipv4))))
+'
 }
 
 normalize_access_rules() {
@@ -524,10 +543,10 @@ try:
                 continue
             group = "custom"
             if kind == "own":
-                match = re.fullmatch(r"\d{8}-\d{6}-(ssh|firewall)(?:\.[A-Za-z0-9]{6})?", entry.name)
+                match = re.fullmatch(r"\d{8}-\d{6}-(ssh|firewall|template)(?:\.[A-Za-z0-9]{6})?", entry.name)
                 if match:
                     group = match[1]
-                    required = "sshd_config" if group == "ssh" else "nft-ruleset.txt"
+                    required = {"ssh": "sshd_config", "firewall": "nft-ruleset.txt", "template": "index.html"}[group]
                 elif re.fullmatch(r"ports\.[A-Za-z0-9]{6}", entry.name):
                     group, required = "ports", "guard.conf"
                 else:
@@ -756,13 +775,14 @@ system_update() {
 }
 
 choose_https_mode() {
-    local choice
+    local choice default=1
+    case "${1:-both}" in tcp) default=2;; udp) default=3;; none) default=0;; esac
     printf '\n443 для VPN:\n  1) TCP + UDP (рекомендуется)\n  2) Только TCP\n  3) Только UDP\n  0) Не открывать\n' >&2
     while true; do
-        read -r -p "Выбор [1]: " choice || true
-        choice=${choice:-1}
+        read -r -p "Выбор [$default]: " choice || return 1
+        choice=${choice:-$default}
         case $choice in 1) printf 'both\n'; return;; 2) printf 'tcp\n'; return;; 3) printf 'udp\n'; return;; 0) printf 'none\n'; return;; esac
-        warn "Введите 0, 1, 2 или 3."
+        warn "Введите 0, 1, 2 или 3." >&2
     done
 }
 
@@ -830,10 +850,10 @@ ROLLBACK
 
 configure_firewall() {
     require_root
-    ensure_packages nftables python3 curl ca-certificates iproute2 || return 1
+    ensure_packages nftables python3 curl ca-certificates iproute2 util-linux || return 1
     local ssh_port https_mode=none node_port="" panel_ip="" backup current_role
-    local tcp_ports="" udp_ports="" ssh_sources="" ipv6=no blocklists=yes answer protocol port source rule
-    local ufw_active=no rollback_unit
+    local tcp_ports="" udp_ports="" ssh_sources="" ipv6=no blocklists=yes answer protocol port source
+    local ufw_active=no rollback_unit client_sources="" govips_mode=off
     local -a restricted_rules=()
     ssh_port=$(detect_ssh_port)
     info "Обнаружен SSH-порт: ${ssh_port}/tcp"
@@ -843,13 +863,37 @@ configure_firewall() {
         udp_ports=$(read_guard_extra_ports udp) || return 1
     fi
     if [[ $SERVER_ROLE == node ]]; then
-        https_mode=$(choose_https_mode)
-        read -r -p "Порт Remnawave-ноды [${DEFAULT_NODE_PORT}]: " node_port || return 0
+        if [[ $current_role == node ]]; then
+            node_port=$(read_guard_setting NODE_PORT "$DEFAULT_NODE_PORT") || return 1
+            panel_ip=$(read_guard_setting PANEL_IPV4 "$DEFAULT_PANEL_IP") || return 1
+            client_sources=$(read_guard_setting NODE_CLIENT_SOURCES '') || return 1
+            ssh_sources=$(read_guard_setting SSH_SOURCES '') || return 1
+            govips_mode=$(read_guard_setting GOVIPS_MODE off) || return 1
+        fi
         node_port=${node_port:-$DEFAULT_NODE_PORT}
-        valid_port "$node_port" || { error "Некорректный порт."; return 1; }
-        read -r -p "IPv4/CIDR панели, которой разрешён порт ${node_port} [${DEFAULT_PANEL_IP}]: " panel_ip || return 0
         panel_ip=${panel_ip:-$DEFAULT_PANEL_IP}
+        https_mode=$(choose_https_mode "$(read_guard_setting HTTPS_MODE both)") || return 0
+        read -r -p "Порт Remnawave-ноды [$node_port]: " answer || return 0
+        node_port=${answer:-$node_port}
+        valid_port "$node_port" || { error "Некорректный порт."; return 1; }
+        read -r -p "IPv4/CIDR панели для порта ${node_port} [$panel_ip]: " answer || return 0
+        panel_ip=${answer:-$panel_ip}
         valid_ipv4_cidr "$panel_ip" || { error "Некорректный IPv4 или CIDR."; return 1; }
+        if [[ $https_mode != none ]]; then
+            if [[ -n $client_sources ]]; then info 'Для 443 уже сохранён список доверенных сетей.'; fi
+            read -r -p "IPv4/CIDR для 443, yandex-cdn, '-' = все, Enter = оставить: " answer || return 0
+            [[ $answer != - ]] || client_sources=""
+            [[ $answer == - ]] || client_sources=$(node_client_sources "${answer:-$client_sources}") || return 1
+            [[ $client_sources != *:* ]] || { error "На ноде нужны IPv4/CIDR для 443."; return 1; }
+        else
+            client_sources=""
+        fi
+        read -r -p "IPv4/CIDR для SSH [${ssh_sources:-все}]; '-' = все: " answer || return 0
+        [[ $answer != - ]] || ssh_sources=""
+        [[ $answer == - ]] || ssh_sources=$(normalize_ip_sources "${answer:-$ssh_sources}") || return 1
+        if [[ $ssh_sources == *:* || ${SSH_CONNECTION:-} == *:* ]]; then
+            error "Профиль ноды использует IPv4. Настройте firewall из IPv4 SSH-сессии или консоли."; return 1
+        fi
     else
         step "Действующие сервисы и опубликованные Docker-порты"
         ss -lntup || return 1
@@ -876,29 +920,52 @@ configure_firewall() {
         if [[ $ipv6 == no && ( $ssh_sources == *:* || ${SSH_CONNECTION:-} == *:* ) ]]; then
             error "SSH использует IPv6: включите IPv6, чтобы сохранить доступ."; return 1
         fi
-        if [[ $current_role == server ]]; then
-            mapfile -t restricted_rules < <(
-                # shellcheck disable=SC1090
-                source "$GUARD_CONFIG"
-                printf '%s\n' "${RESTRICTED_RULES[@]:-}"
-            )
-            [[ ${restricted_rules[0]:-} != "" ]] || restricted_rules=()
-            if ((${#restricted_rules[@]})); then
-                printf 'Сохранённые ограничения (протокол|порт|IP/CIDR):\n  %s\n' "${restricted_rules[@]}"
-                confirm "Сохранить эти ограничения?" Y || restricted_rules=()
+    fi
+    if [[ $current_role == "$SERVER_ROLE" && -f $GUARD_CONFIG ]]; then
+        mapfile -t restricted_rules < <(
+            # shellcheck disable=SC1090
+            source "$GUARD_CONFIG"
+            printf '%s\n' "${RESTRICTED_RULES[@]:-}"
+        )
+        [[ ${restricted_rules[0]:-} != "" ]] || restricted_rules=()
+        if ((${#restricted_rules[@]})); then
+            printf 'Сохранённые ограничения (протокол|порт|IP/CIDR):\n  %s\n' "${restricted_rules[@]}"
+            confirm "Сохранить эти ограничения?" Y || restricted_rules=()
+        fi
+    fi
+    if [[ $SERVER_ROLE == node ]]; then
+        info "Дополнительные публичные порты: TCP ${tcp_ports:-нет}, UDP ${udp_ports:-нет}. Пункт 10 меняет их отдельно."
+    fi
+    info "Добавьте порты с доступом только от IP/CIDR. Пустой номер завершает ввод."
+    while true; do
+        read -r -p "Ограниченный порт [Enter = продолжить]: " port || return 0
+        [[ -n $port ]] || break
+        valid_port "$port" || { error "Некорректный порт."; return 1; }
+        port=$((10#$port))
+        read -r -p "Протокол [tcp]: " protocol || return 0
+        protocol=${protocol:-tcp}
+        [[ $protocol == tcp || $protocol == udp ]] || { error 'Выберите TCP или UDP.'; return 1; }
+        validate_guard_extra_ports "$port" "" "$node_port" "$ssh_port" "$SERVER_ROLE" || return 1
+        if [[ $SERVER_ROLE == node ]]; then
+            read -r -p "Разрешённые IPv4/CIDR или yandex-cdn: " source || return 0
+            source=$(node_client_sources "$source") || return 1
+        else
+            read -r -p "Разрешённые IP/CIDR: " source || return 0
+            source=$(normalize_ip_sources "$source") || return 1
+        fi
+        [[ -n $source ]] || { error "Укажите хотя бы один IP/CIDR."; return 1; }
+        local -a sources=()
+        IFS=' ' read -r -a sources <<< "$source"
+        for source in "${sources[@]}"; do restricted_rules+=("${protocol}|${port}|${source}"); done
+        if [[ $SERVER_ROLE == node ]]; then
+            if [[ $protocol == tcp ]]; then
+                tcp_ports=$(edit_guard_port_list "$tcp_ports" remove "$port") || return 1
+            else
+                udp_ports=$(edit_guard_port_list "$udp_ports" remove "$port") || return 1
             fi
         fi
-        info "Добавьте порты с доступом только от IP/CIDR. Пустой номер завершает ввод."
-        while true; do
-            read -r -p "Ограниченный порт [Enter = продолжить]: " port || return 0
-            [[ -n $port ]] || break
-            [[ $port =~ ^[0-9]{1,5}$ ]] && valid_port "$port" || { error "Некорректный порт."; return 1; }
-            read -r -p "Протокол [tcp]: " protocol || return 0
-            protocol=${protocol:-tcp}
-            read -r -p "Разрешённый IP/CIDR: " source || return 0
-            rule=$(normalize_access_rules "${protocol}|${port}|${source}") || return 1
-            restricted_rules+=("$rule")
-        done
+    done
+    if [[ $SERVER_ROLE == server ]]; then
         blocklists=no
         confirm "Включить внешние Anti-Scanner/IP-списки?" && blocklists=yes
     fi
@@ -908,12 +975,13 @@ configure_firewall() {
     printf '  🔐 SSH:             %s/tcp — %s\n' "$ssh_port" "${ssh_sources:-для всех}"
     printf '  Публичные TCP:     %s\n  Публичные UDP:     %s\n' "${tcp_ports:-нет}" "${udp_ports:-нет}"
     if [[ $SERVER_ROLE == node ]]; then
-        printf '  🌐 VPN 443:         %s\n' "$https_mode"
+        printf '  🌐 VPN 443:         %s · %s\n' "$https_mode" "${client_sources:-все}"
         printf '  🧩 Remnawave API:   %s/tcp — только %s\n' "$node_port" "$panel_ip"
+        printf '  GOVIPS:            %s\n' "$govips_mode"
     else
         printf '  IPv6:             %s\n  IP-списки:         %s\n' "$ipv6" "$blocklists"
-        ((${#restricted_rules[@]} == 0)) || printf '  Ограничение:       %s\n' "${restricted_rules[@]}"
     fi
+    ((${#restricted_rules[@]} == 0)) || printf '  Ограничение:       %s\n' "${restricted_rules[@]}"
     warn "Будет включён единый nftables-firewall. Все неразрешённые входящие и Docker-порты будут закрыты."
     warn "Проверьте правила существующего firewall и firewall у хостинга. Правила других nftables-таблиц сохраняются."
     if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status | grep -q '^Status: active'; then
@@ -936,7 +1004,8 @@ configure_firewall() {
     systemd-run --quiet --unit="$rollback_unit" --on-active=5min --timer-property=AccuracySec=1s \
         /bin/bash "$backup/rollback.sh" || { error "Не удалось запланировать откат; правила не изменены."; return 1; }
     systemctl stop server-tool-guard.timer server-tool-guard-update.service 2>/dev/null || true
-    if ! write_guard_config "$ssh_port" "$node_port" "$panel_ip" "$https_mode" \
+    if ! CLIENT_SOURCES_TO_WRITE="$client_sources" GOVIPS_MODE_TO_WRITE="$govips_mode" \
+        write_guard_config "$ssh_port" "$node_port" "$panel_ip" "$https_mode" \
         "$tcp_ports" "$udp_ports" "$ssh_sources" "$ipv6" "$blocklists" "${restricted_rules[@]}" ||
         ! install_guard_runtime ||
         { [[ $ufw_active == yes ]] && ! ufw --force disable; }; then
@@ -986,6 +1055,8 @@ ENABLE_IPV6="${ipv6}"
 NODE_PORT="${node_port}"
 PANEL_IPV4="${panel_ip}"
 HTTPS_MODE="${https_mode}"
+NODE_CLIENT_SOURCES="${CLIENT_SOURCES_TO_WRITE:-}"
+GOVIPS_MODE="${GOVIPS_MODE_TO_WRITE:-off}"
 # Public ports; IPv6 is controlled by ENABLE_IPV6.
 EXTRA_TCP_PORTS="${tcp_ports}"
 EXTRA_UDP_PORTS="${udp_ports}"
@@ -1018,10 +1089,16 @@ GUARD_HEADER
 TABLE=server_tool_guard
 CACHE=/var/lib/server-tool/blocklist-v4.txt
 [[ -r $CONFIG ]] || { echo "Missing $CONFIG" >&2; exit 1; }
+mkdir -p /var/lib/server-tool
+exec 9>"$CACHE.lock"
+flock -w 30 9
 SERVER_ROLE=node
 ENABLE_IPV6=no
 BLOCKLIST_ENABLED=yes
 SSH_SOURCES=""
+NODE_CLIENT_SOURCES=""
+GOVIPS_MODE=off
+BLOCKLIST_URLS=()
 RESTRICTED_RULES=()
 # shellcheck disable=SC1090
 source "$CONFIG"
@@ -1030,21 +1107,33 @@ SSH_PORT=$((10#$SSH_PORT))
 [[ $SERVER_ROLE == node || $SERVER_ROLE == server ]] || exit 1
 [[ $ENABLE_IPV6 == yes || $ENABLE_IPV6 == no ]] || exit 1
 [[ $BLOCKLIST_ENABLED == yes || $BLOCKLIST_ENABLED == no ]] || exit 1
+[[ $GOVIPS_MODE =~ ^(off|monitor|block)$ ]] || exit 1
 [[ ${HTTPS_MODE:-} =~ ^(both|tcp|udp|none)$ ]] || exit 1
 EXTRA_TCP_PORTS=$(normalize_guard_ports "${EXTRA_TCP_PORTS:-}") || { echo 'Invalid EXTRA_TCP_PORTS' >&2; exit 1; }
 EXTRA_UDP_PORTS=$(normalize_guard_ports "${EXTRA_UDP_PORTS:-}") || { echo 'Invalid EXTRA_UDP_PORTS' >&2; exit 1; }
 SSH_SOURCES=$(normalize_ip_sources "$SSH_SOURCES") || exit 1
+NODE_CLIENT_SOURCES=$(normalize_ip_sources "$NODE_CLIENT_SOURCES") || exit 1
 rules=$(normalize_access_rules "${RESTRICTED_RULES[@]}") || exit 1
 if [[ $SERVER_ROLE == node ]]; then
+    [[ $NODE_CLIENT_SOURCES != *:* ]] || exit 1
+    [[ " $NODE_CLIENT_SOURCES " != *' 0.0.0.0/0 '* && " $SSH_SOURCES " != *' 0.0.0.0/0 '* ]] || {
+        echo 'Use the public-port setting for unrestricted IPv4 access' >&2; exit 1;
+    }
     valid_port "${NODE_PORT:-}" || exit 1
     NODE_PORT=$((10#$NODE_PORT))
+    if ((NODE_PORT == SSH_PORT)) || { [[ $HTTPS_MODE == tcp || $HTTPS_MODE == both ]] && ((NODE_PORT == 443 || SSH_PORT == 443)); }; then
+        echo 'SSH, node API and public TCP 443 must use distinct ports' >&2
+        exit 1
+    fi
     python3 - "$PANEL_IPV4" <<'PY' >/dev/null
 import ipaddress, sys
 n = ipaddress.ip_network(sys.argv[1], strict=False)
-assert n.version == 4
+if n.version != 4 or not n.prefixlen:
+    raise SystemExit("Panel access requires a restricted IPv4 network")
 PY
 else
     [[ $HTTPS_MODE == none ]] || { echo 'Use public port lists for the server profile' >&2; exit 1; }
+    [[ -z $NODE_CLIENT_SOURCES && $GOVIPS_MODE == off ]] || exit 1
 fi
 validate_guard_extra_ports "$EXTRA_TCP_PORTS" "$EXTRA_UDP_PORTS" "${NODE_PORT:-}" "$SSH_PORT" "$SERVER_ROLE" || exit 1
 if [[ $ENABLE_IPV6 == no && $SSH_SOURCES == *:* ]]; then
@@ -1056,6 +1145,7 @@ while IFS='|' read -r protocol port source; do
     public_ports=$EXTRA_TCP_PORTS
     [[ $protocol != udp ]] || public_ports=$EXTRA_UDP_PORTS
     [[ " $public_ports " != *" $port "* ]] || { echo "Port $port/$protocol cannot be public and restricted" >&2; exit 1; }
+    [[ $SERVER_ROLE != node || $source != 0.0.0.0/0 ]] || exit 1
     [[ $ENABLE_IPV6 == yes || $source != *:* ]] || { echo 'IPv6 access rules require ENABLE_IPV6=yes' >&2; exit 1; }
 done <<< "$rules"
 
@@ -1082,97 +1172,169 @@ emit_access_rules() {
         family=ip
         [[ $source != *:* ]] || family=ip6
         if [[ $chain == forward ]]; then
-            printf '    %s saddr %s meta l4proto %s ct original proto-dst %s counter accept\n' "$family" "$source" "$protocol" "$port"
+            printf '    ct status dnat %s saddr %s meta l4proto %s ct original proto-dst %s counter accept\n' "$family" "$source" "$protocol" "$port"
         else
             printf '    %s saddr %s %s dport %s counter accept\n' "$family" "$source" "$protocol" "$port"
         fi
     done <<< "$rules"
 }
 
+emit_node_clients() {
+    local hook=$1 protocol port_match dnat=''
+    if [[ $hook == forward ]]; then dnat='ct status dnat '; fi
+    for protocol in tcp udp; do
+        [[ $HTTPS_MODE == both || $HTTPS_MODE == "$protocol" ]] || continue
+        if [[ $hook == forward ]]; then
+            port_match="meta l4proto $protocol ct original proto-dst 443"
+        else
+            port_match="$protocol dport 443"
+        fi
+        if [[ -n $NODE_CLIENT_SOURCES ]]; then
+            printf '    %sip saddr @node_clients_v4 %s counter accept\n' "$dnat" "$port_match"
+        else
+            printf '    %smeta nfproto ipv4 %s jump public_node\n' "$dnat" "$port_match"
+        fi
+    done
+}
+
 public_family='meta nfproto ipv4'
 [[ $ENABLE_IPV6 != yes ]] || public_family=''
-mkdir -p /var/lib/server-tool
 work=$(mktemp -d /run/server-tool-guard.XXXXXX)
 trap 'rm -rf "$work"' EXIT
-if [[ ${1:---apply} == --refresh && $BLOCKLIST_ENABLED == yes ]]; then
-    : > "$work/raw"
-    downloaded=0
-    expected=${#BLOCKLIST_URLS[@]}
-    for url in "${BLOCKLIST_URLS[@]:-}"; do
-        if curl --fail --silent --show-error --location --max-time 45 "$url" >> "$work/raw"; then
-            downloaded=$((downloaded + 1)); printf '\n' >> "$work/raw"
-        else
-            echo "Warning: could not download $url" >&2
+v4=$CACHE v6=$CACHE.ipv6 gov=$CACHE.govips
+if [[ ${1:---apply} == --refresh ]]; then
+    : > "$work/sources"
+    index=0
+    fetch_list() {
+        local kind=$1 url=$2 name
+        index=$((index + 1))
+        name="source.$index"
+        printf '%s\t%s\t%s\n' "$kind" "$name" "$url" >> "$work/sources"
+        if ! curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 8 --max-time 20 --max-filesize 8388608 -o "$work/$name" "$url"; then
+            rm -f -- "$work/$name"
         fi
-    done
+    }
     geo_codes=()
+    if [[ $BLOCKLIST_ENABLED == yes ]]; then
+        for url in "${BLOCKLIST_URLS[@]}"; do fetch_list base "$url"; done
+    fi
     IFS=' ' read -r -a geo_codes <<< "${GEO_COUNTRIES:-}"
     for cc in "${geo_codes[@]}"; do
+        [[ $BLOCKLIST_ENABLED == yes ]] || break
         [[ -n $cc ]] || continue
         [[ $cc =~ ^[a-zA-Z]{2}$ ]] || continue
-        expected=$((expected + 1))
-        url="https://www.ipdeny.com/ipblocks/data/countries/${cc,,}.zone"
-        if curl --fail --silent --show-error --location --max-time 45 "$url" >> "$work/raw"; then
-            downloaded=$((downloaded + 1)); printf '\n' >> "$work/raw"
-        fi
+        fetch_list base "https://www.ipdeny.com/ipblocks/data/countries/${cc,,}.zone"
+        [[ $ENABLE_IPV6 != yes ]] || fetch_list base "https://www.ipdeny.com/ipv6/ipaddresses/blocks/${cc,,}.zone"
     done
-    if ((downloaded == 0)); then
-        [[ -s $CACHE ]] || { echo "No list source and no cache; core firewall will use an empty blocklist." >&2; : > "$CACHE"; }
-    elif ((downloaded < expected)) && [[ -s $CACHE ]]; then
-        echo "Only $downloaded of $expected sources downloaded; keeping cached blocklist." >&2
-    else
-        python3 - "$work/raw" "$work/collapsed" <<'PY'
-import ipaddress, sys
-nets = []
-with open(sys.argv[1], encoding="utf-8", errors="ignore") as source:
-    for raw in source:
-        value = raw.split("#", 1)[0].strip()
+    if [[ $GOVIPS_MODE != off ]]; then
+        fetch_list gov 'https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist-v4.txt'
+    fi
+    if [[ -s $work/sources ]]; then
+        python3 - "$work" "$CACHE" <<'PY'
+import ipaddress as ip
+import json
+from pathlib import Path
+import sys
+
+work, cache = map(Path, sys.argv[1:])
+state = Path(f"{cache}.sources.json")
+previous = json.loads(state.read_text()) if state.is_file() else {}
+current = dict(previous)
+networks = {"base": {4: [], 6: []}, "gov": {4: [], 6: []}}
+missing_base = False
+
+def read_list(path):
+    if not path.is_file():
+        return {4: [], 6: []}
+    if path.stat().st_size > 8_388_608:
+        raise ValueError("oversized source")
+    result = {4: [], 6: []}
+    lines = path.read_text(encoding="utf-8-sig").splitlines()
+    if len(lines) > 500_000:
+        raise ValueError("too many entries")
+    for line in lines:
+        value = line.split("#", 1)[0].strip()
         if not value:
             continue
-        try:
-            net = ipaddress.ip_network(value, strict=False)
-            # Never let a bad feed block default/private/local ranges or consume unbounded RAM.
-            if net.version == 4 and net.prefixlen >= 8 and net.is_global:
-                nets.append(net)
-        except ValueError:
-            pass
-if len(nets) > 500_000:
-    raise SystemExit("Too many blocklist entries; refusing update")
-with open(sys.argv[2], "w", encoding="ascii") as target:
-    for net in ipaddress.collapse_addresses(nets):
-        target.write(f"{net}\n")
+        net = ip.ip_network(value, strict=False)
+        if '%' in value or not net.is_global or net.is_multicast or net.prefixlen < (8 if net.version == 4 else 12):
+            continue
+        result[net.version].append(net)
+    return {family: list(ip.collapse_addresses(entries)) for family, entries in result.items()}
+
+def coverage(entries):
+    return sum(net.num_addresses for net in entries)
+
+def write_list(path, entries):
+    path.write_text("".join(f"{net}\n" for net in ip.collapse_addresses(entries)), encoding="ascii")
+
+rows = (work / "sources").read_text().splitlines()
+for row in rows:
+    kind, filename, url = row.split("\t")
+    old = {4: [], 6: []}
+    for value in previous.get(url, []):
+        net = ip.ip_network(value)
+        old[net.version].append(net)
+    try:
+        new = read_list(work / filename)
+        if not any(new.values()) or (kind == "gov" and not new[4]):
+            raise ValueError("empty or unusable download")
+        for family in (4, 6):
+            for measure in (len, coverage):
+                before, after = measure(old[family]), measure(new[family])
+                if before and (2 * after < before or after > 5 * before):
+                    raise ValueError(f"unexpected IPv{family} change ({before} -> {after})")
+        current[url] = [str(net) for entries in new.values() for net in entries]
+        print(f"{url}: IPv4 {len(new[4])}, IPv6 {len(new[6])}")
+    except (OSError, ValueError) as exc:
+        print(f"{url}: {exc}; using last validated data if available", file=sys.stderr)
+        new = old
+    for family in networks[kind]:
+        networks[kind][family].extend(new[family])
+    if not any(new.values()) and kind == "base":
+        missing_base = True
+
+# During migration from the old combined cache, preserve coverage until every source has a snapshot.
+if missing_base:
+    for family, path in ((4, cache), (6, Path(f"{cache}.ipv6"))):
+        networks["base"][family].extend(read_list(path)[family])
+if any(row.startswith("base\t") for row in rows):
+    write_list(work / "v4", networks["base"][4])
+    write_list(work / "v6", networks["base"][6])
+if any(row.startswith("gov\t") for row in rows):
+    write_list(work / "gov", networks["gov"][4])
+(work / "state").write_text(json.dumps(current), encoding="ascii")
 PY
-        count=$(wc -l < "$work/collapsed")
-        if ((count >= 10)); then
-            install -m 600 "$work/collapsed" "$CACHE"
-        elif [[ ! -s $CACHE ]]; then
-            echo "Only $count valid networks and no cache; refusing update." >&2
-            exit 1
-        else
-            echo "Only $count valid networks; keeping cached blocklist." >&2
-        fi
+        [[ ! -f $work/v4 ]] || v4=$work/v4
+        [[ ! -f $work/v6 ]] || v6=$work/v6
+        [[ ! -f $work/gov ]] || gov=$work/gov
     fi
 fi
-touch "$CACHE"
-count=$(wc -l < "$CACHE")
-[[ $BLOCKLIST_ENABLED != no ]] || count=0
-{
-    nft list table inet "$TABLE" >/dev/null 2>&1 && echo "delete table inet $TABLE"
-    cat <<EOF
-table inet $TABLE {
-  set blocked_v4 {
-    type ipv4_addr
-    flags interval
-    auto-merge
-EOF
-    if ((count > 0)); then
+emit_address_set() {
+    local name=$1 address_type=$2 path=$3
+    printf '  set %s {\n    type %s\n    flags interval\n    auto-merge\n' "$name" "$address_type"
+    if [[ -s $path ]]; then
         echo '    elements = {'
-        sed 's/^/      /; s/$/,/' "$CACHE"
+        sed 's/^/      /; s/$/,/' "$path"
         echo '    }'
     fi
-    cat <<EOF
-  }
-EOF
+    echo '  }'
+}
+if [[ ${1:-} == --refresh && $GOVIPS_MODE != off && ! -s $gov ]]; then
+    echo 'GOVIPS has no validated data; its rule will remain inactive until a successful download.' >&2
+fi
+{
+    nft list table inet "$TABLE" >/dev/null 2>&1 && echo "delete table inet $TABLE"
+    echo "table inet $TABLE {"
+    if [[ $BLOCKLIST_ENABLED == yes ]]; then
+        emit_address_set blocked_v4 ipv4_addr "$v4"
+        [[ $ENABLE_IPV6 != yes ]] || emit_address_set blocked_v6 ipv6_addr "$v6"
+    else
+        emit_address_set blocked_v4 ipv4_addr /dev/null
+        [[ $ENABLE_IPV6 != yes ]] || emit_address_set blocked_v6 ipv6_addr /dev/null
+    fi
+    [[ $GOVIPS_MODE == off ]] || emit_address_set govips_v4 ipv4_addr "$gov"
     if [[ $SERVER_ROLE == node ]]; then
         cat <<EOF
   set panel_v4 {
@@ -1181,6 +1343,16 @@ EOF
     elements = { $PANEL_IPV4 }
   }
 EOF
+        if [[ -n $NODE_CLIENT_SOURCES ]]; then
+            cat <<EOF
+  set node_clients_v4 {
+    type ipv4_addr
+    flags interval
+    auto-merge
+    elements = { ${NODE_CLIENT_SOURCES// /, } }
+  }
+EOF
+        fi
     fi
     cat <<EOF
   set extra_tcp_ports {
@@ -1195,6 +1367,21 @@ EOF
     [[ -z $EXTRA_UDP_PORTS ]] || printf '    elements = { %s }\n' "${EXTRA_UDP_PORTS// /, }"
     cat <<EOF
   }
+EOF
+    if [[ $SERVER_ROLE == node ]]; then
+        echo '  chain public_node {'
+        echo '    ct state new ip saddr @blocked_v4 counter drop'
+        case $GOVIPS_MODE in
+            monitor)
+                echo '    ct state new ip saddr @govips_v4 counter comment "GOVIPS monitor"'
+                echo '    ct state new ip saddr @govips_v4 limit rate 5/minute burst 10 packets log prefix "ServerTool GOVIPS "'
+                ;;
+            block) echo '    ct state new ip saddr @govips_v4 counter drop comment "GOVIPS block"' ;;
+        esac
+        echo '    counter accept'
+        echo '  }'
+    fi
+    cat <<EOF
   chain input {
     type filter hook input priority -20; policy drop;
     iifname "lo" counter accept
@@ -1209,22 +1396,21 @@ EOF
     [[ $ENABLE_IPV6 != yes ]] || echo '    meta nfproto ipv6 udp sport 547 udp dport 546 counter accept'
     if [[ $SERVER_ROLE == node ]]; then
         echo "    meta nfproto ipv4 ip saddr @panel_v4 tcp dport $NODE_PORT counter accept"
+        [[ -z $SSH_SOURCES ]] || emit_ssh_rules
+        emit_access_rules input
+        emit_node_clients input
+        printf '    meta nfproto ipv4 tcp dport @extra_tcp_ports jump public_node\n'
+        printf '    meta nfproto ipv4 udp dport @extra_udp_ports jump public_node\n'
+        [[ -n $SSH_SOURCES ]] || { echo '    meta nfproto ipv4 ip saddr @blocked_v4 counter drop'; emit_ssh_rules; }
     else
         # Explicit SSH access must survive third-party IP-list updates.
         emit_ssh_rules
+        echo '    meta nfproto ipv4 ip saddr @blocked_v4 counter drop'
+        [[ $ENABLE_IPV6 != yes ]] || echo '    ip6 saddr @blocked_v6 counter drop'
+        emit_access_rules input
+        printf '    %s tcp dport @extra_tcp_ports counter accept\n' "$public_family"
+        printf '    %s udp dport @extra_udp_ports counter accept\n' "$public_family"
     fi
-    cat <<EOF
-    meta nfproto ipv4 ip saddr @blocked_v4 counter drop
-EOF
-    [[ $SERVER_ROLE != node ]] || emit_ssh_rules
-    emit_access_rules input
-    printf '    %s tcp dport @extra_tcp_ports counter accept\n' "$public_family"
-    printf '    %s udp dport @extra_udp_ports counter accept\n' "$public_family"
-    case "$HTTPS_MODE" in
-        both) echo '    meta nfproto ipv4 tcp dport 443 counter accept'; echo '    meta nfproto ipv4 udp dport 443 counter accept' ;;
-        tcp)  echo '    meta nfproto ipv4 tcp dport 443 counter accept' ;;
-        udp)  echo '    meta nfproto ipv4 udp dport 443 counter accept' ;;
-    esac
     cat <<EOF
     counter drop
   }
@@ -1236,7 +1422,6 @@ EOF
         echo "    meta nfproto ipv4 ip saddr @panel_v4 meta l4proto tcp ct original proto-dst $NODE_PORT counter accept"
     fi
     cat <<EOF
-    ip saddr @blocked_v4 counter drop
     ct state established,related counter accept
     iifname "docker0" counter accept
     iifname "br-*" counter accept
@@ -1244,15 +1429,17 @@ EOF
     if [[ $SERVER_ROLE == node ]]; then
         echo "    meta l4proto tcp ct original proto-dst $NODE_PORT counter drop"
         echo "    tcp dport $NODE_PORT counter drop"
+        emit_access_rules forward
+        emit_node_clients forward
+        echo '    ct status dnat meta nfproto ipv4 meta l4proto tcp ct original proto-dst @extra_tcp_ports jump public_node'
+        echo '    ct status dnat meta nfproto ipv4 meta l4proto udp ct original proto-dst @extra_udp_ports jump public_node'
+    else
+        echo '    ct status dnat ip saddr @blocked_v4 counter drop'
+        [[ $ENABLE_IPV6 != yes ]] || echo '    ct status dnat ip6 saddr @blocked_v6 counter drop'
+        emit_access_rules forward
+        printf '    %s meta l4proto tcp ct original proto-dst @extra_tcp_ports counter accept\n' "$public_family"
+        printf '    %s meta l4proto udp ct original proto-dst @extra_udp_ports counter accept\n' "$public_family"
     fi
-    emit_access_rules forward
-    printf '    %s meta l4proto tcp ct original proto-dst @extra_tcp_ports counter accept\n' "$public_family"
-    printf '    %s meta l4proto udp ct original proto-dst @extra_udp_ports counter accept\n' "$public_family"
-    case "$HTTPS_MODE" in
-        both) echo '    meta nfproto ipv4 meta l4proto tcp ct original proto-dst 443 counter accept'; echo '    meta nfproto ipv4 meta l4proto udp ct original proto-dst 443 counter accept' ;;
-        tcp)  echo '    meta nfproto ipv4 meta l4proto tcp ct original proto-dst 443 counter accept' ;;
-        udp)  echo '    meta nfproto ipv4 meta l4proto udp ct original proto-dst 443 counter accept' ;;
-    esac
     cat <<EOF
     ct status dnat counter drop
   }
@@ -1265,7 +1452,16 @@ if [[ ${1:-} == --check ]]; then
     exit 0
 fi
 nft --file "$work/rules.nft"
-echo "Applied nftables firewall with $count blocked IPv4 networks"
+for entry in "v4:$CACHE" "v6:$CACHE.ipv6" "gov:$CACHE.govips" "state:$CACHE.sources.json"; do
+    [[ -f $work/${entry%%:*} ]] || continue
+    destination=${entry#*:}
+    temporary=$(mktemp "$destination.XXXXXX")
+    if ! cat "$work/${entry%%:*}" > "$temporary" || ! mv -fT "$temporary" "$destination"; then
+        rm -f -- "$temporary"
+        exit 1
+    fi
+done
+echo "Applied nftables firewall (GOVIPS: $GOVIPS_MODE)"
 GUARD_SCRIPT
 }
 
@@ -1297,7 +1493,7 @@ After=network-online.target server-tool-guard.service
 [Service]
 Type=oneshot
 ExecStart=${GUARD_UPDATER} --refresh
-TimeoutStartSec=3min
+TimeoutStartSec=5min
 EOF
     cat > "$GUARD_TIMER" <<EOF || return 1
 [Unit]
@@ -1377,14 +1573,23 @@ change_guard_port() (
         error "Проверка не пройдена; настройки и правила не изменены. Копия: $backup"
         return 1
     fi
-    if install -m 600 "$backup/new-guard.conf" "$GUARD_CONFIG" &&
-        install -m 750 "$backup/new-updater" "$GUARD_UPDATER" &&
-        bash "$GUARD_UPDATER" --apply; then
+    if apply_guard_candidate "$backup"; then
         success "Дополнительные порты сохранены и применены. Копия: $backup"
         log INFO "extra port ${action} port=${port} protocol=${protocol}"
     else
-        if install -m 600 "$backup/guard.conf" "$GUARD_CONFIG" &&
-            install -m 750 "$backup/updater" "$GUARD_UPDATER" &&
+        return 1
+    fi
+)
+
+apply_guard_candidate() {
+    local backup=$1
+    if replace_guard_file 600 "$backup/new-guard.conf" "$GUARD_CONFIG" &&
+        replace_guard_file 750 "$backup/new-updater" "$GUARD_UPDATER" &&
+        bash "$GUARD_UPDATER" --apply; then
+        return 0
+    else
+        if replace_guard_file 600 "$backup/guard.conf" "$GUARD_CONFIG" &&
+            replace_guard_file 750 "$backup/updater" "$GUARD_UPDATER" &&
             bash "$GUARD_UPDATER" --apply; then
             error "Применение не удалось; прежние настройки восстановлены. Копия: $backup"
         else
@@ -1392,6 +1597,41 @@ change_guard_port() (
         fi
         return 1
     fi
+}
+
+replace_guard_file() {
+    local mode=$1 source=$2 destination=$3 temporary
+    temporary=$(mktemp "$destination.XXXXXX") || return 1
+    if install -m "$mode" "$source" "$temporary" && mv -fT -- "$temporary" "$destination"; then return 0; fi
+    rm -f -- "$temporary"
+    return 1
+}
+
+configure_govips() (
+    local mode selection backup
+    if [[ ! -f $GUARD_CONFIG || -L $GUARD_CONFIG || ! -f $GUARD_UPDATER || -L $GUARD_UPDATER || $(read_guard_setting SERVER_ROLE node) != node ]]; then
+        error 'Нужен установленный firewall с профилем ноды.'
+        return 1
+    fi
+    info "GOVIPS сейчас: $(read_guard_setting GOVIPS_MODE off)."
+    printf '%s\n' '  1) Наблюдение — считать совпадения на открытых клиентских портах' \
+        '  2) Блокировка новых входящих на открытых клиентских портах' '  3) Выключить' '  0) Назад'
+    read -r -p 'Выбор [1]: ' selection || return 0
+    case ${selection:-1} in 0) return 0;; 1) mode=monitor;; 2) mode=block;; 3) mode=off;; *) return 1;; esac
+    if [[ $mode == block ]]; then
+        confirm 'Блокировать совпадения с GOVIPS (включая сети CDN и хостингов)?' || return 0
+    fi
+    mkdir -p "$BACKUP_ROOT" || return 1
+    backup=$(mktemp -d "${BACKUP_ROOT}/ports.XXXXXX") || return 1
+    cp -p "$GUARD_CONFIG" "$backup/guard.conf" && cp -p "$GUARD_UPDATER" "$backup/updater" || return 1
+    awk '!/^[[:space:]]*GOVIPS_MODE=/' "$GUARD_CONFIG" > "$backup/new-guard.conf" || return 1
+    printf '\nGOVIPS_MODE="%s"\n' "$mode" >> "$backup/new-guard.conf" || return 1
+    write_guard_updater "$backup/new-updater" && write_guard_updater "$backup/check-updater" "$backup/new-guard.conf" || return 1
+    bash "$backup/check-updater" --check && apply_guard_candidate "$backup" || return 1
+    if [[ $mode != off ]]; then
+        "$GUARD_UPDATER" --refresh || warn 'Не удалось обновить списки. Проверьте журнал и набор govips_v4.'
+    fi
+    success "Режим GOVIPS сохранён: $mode. Копия: $backup"
 )
 
 guard_ports_menu() {
@@ -1446,6 +1686,7 @@ guard_menu() {
         printf '  4) Показать статус и счётчики\n'
         printf '  5) Удалить только nftables-защиту\n'
         printf '  6) Дополнительные TCP/UDP-порты\n'
+        printf '  7) GOVIPS: наблюдение, блокировка, выключение\n'
         printf '  0) Назад\n\n'
         read -r -p "Выбор: " choice || true
         case $choice in
@@ -1487,7 +1728,7 @@ guard_menu() {
                 ;;
             4)
                 systemctl --no-pager --full status server-tool-guard.service 2>/dev/null || true
-                nft list table inet server_tool_guard 2>/dev/null || warn "Таблица не загружена."
+                nft -t list table inet server_tool_guard 2>/dev/null || warn "Таблица не загружена."
                 pause
                 ;;
             5)
@@ -1502,6 +1743,7 @@ guard_menu() {
                 pause
                 ;;
             6) guard_ports_menu ;;
+            7) configure_govips || warn 'Режим GOVIPS не применён.'; pause ;;
             0) return ;;
             *) warn "Неизвестный пункт."; sleep 1 ;;
         esac
@@ -2339,6 +2581,85 @@ show_status() {
     [[ ! -f /var/run/reboot-required ]] || warn "Требуется перезагрузка."
 }
 
+show_node_diagnostics() {
+    local container log_path
+    printf '%s\n' 'Порты firewall'
+    printf '  443        %s · %s\n' "$(read_guard_setting HTTPS_MODE none)" "$(read_guard_setting NODE_CLIENT_SOURCES 'все')"
+    printf '  TCP / UDP  %s / %s\n' "$(read_guard_extra_ports tcp)" "$(read_guard_extra_ports udp)"
+    printf '  GOVIPS     %s\n\n' "$(read_guard_setting GOVIPS_MODE off)"
+    step 'Фактические TCP/UDP-слушатели'
+    ss -lntup || warn 'Не удалось получить список слушателей.'
+    if command -v docker >/dev/null 2>&1; then
+        step 'Контейнеры и размер журналов'
+        for container in "$REMNANODE_CONTAINER" "$REMNAWAVE_NGINX_CONTAINER"; do
+            if docker inspect --format '{{.Name}} {{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' "$container" 2>/dev/null; then
+                log_path=$(docker inspect --format '{{.LogPath}}' "$container") || continue
+                [[ -z $log_path || ! -f $log_path ]] || du -h -- "$log_path"
+            else
+                printf '  %s: контейнер не найден\n' "$container"
+            fi
+        done
+    fi
+    for log_path in /var/log/remnanode/{access,error}.log /var/log/nginx/remnanode/{access,error}.log; do
+        [[ ! -f $log_path ]] || du -h -- "$log_path"
+    done
+    step 'Политика и счётчики firewall'
+    nft -t list table inet server_tool_guard 2>/dev/null || warn 'Таблица ServerTool не загружена.'
+}
+
+install_node_template() (
+    local theme title message bg fg muted rule scheme=light webroot temporary backup index
+    printf '%s\n' 'Шаблоны статической страницы' '  1) Статус — светлая' '  2) Технические работы — нейтральная' \
+        '  3) Технические работы — тёмная' '  0) Назад'
+    read -r -p 'Шаблон [1]: ' theme || return 0
+    case ${theme:-1} in
+        1) title='Статус сервиса'; message='Сервис работает.'; bg='#f7f6f1'; fg='#242623'; muted='#53634e'; rule='#c8cec0' ;;
+        2) title='Технические работы'; message='Пожалуйста, зайдите позже.'; bg='#f7f5f1'; fg='#302a24'; muted='#6b5949'; rule='#d5cabb' ;;
+        3) title='Технические работы'; message='Пожалуйста, зайдите позже.'; bg='#151916'; fg='#edf2eb'; muted='#b4c4b4'; rule='#46584a'; scheme=dark ;;
+        0) return 0 ;;
+        *) error 'Неизвестный шаблон.'; return 1 ;;
+    esac
+    read -r -p 'Webroot на хосте [/opt/remnanode/www]: ' webroot || return 0
+    webroot=${webroot:-/opt/remnanode/www}
+    if [[ $webroot != /* || $webroot == / || $(realpath -ms -- "$webroot") != "$(realpath -m -- "$webroot")" ]]; then
+        error 'Укажите абсолютный путь к webroot без символических ссылок.'
+        return 1
+    fi
+    webroot=$(realpath -m -- "$webroot") || return 1
+    [[ $webroot != / ]] || return 1
+    index="$webroot/index.html"
+    if [[ -L $index || ( -e $index && ! -f $index ) ]]; then error 'Нужен обычный файл index.html.'; return 1; fi
+    confirm "Установить страницу «$title» в $index?" || return 0
+    [[ -d $webroot ]] || install -d -m 755 -- "$webroot" || return 1
+    if [[ -f $index ]]; then
+        backup=$(make_backup template) || return 1
+        cp -p -- "$index" "$backup/index.html" || return 1
+        info "Копия страницы: $backup/index.html"
+    fi
+    temporary=$(mktemp "$webroot/.index.XXXXXX") || return 1
+    trap 'rm -f -- "$temporary"' EXIT
+    cat > "$temporary" <<EOF || return 1
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="$scheme">
+<title>$title</title>
+<style>
+body { margin: 0; background: $bg; color: $fg; font: 1rem/1.65 system-ui, sans-serif; }
+main { box-sizing: border-box; max-width: 44rem; margin: 0 auto; padding: clamp(4rem, 18vh, 12rem) 1.5rem 3rem; }
+h1 { margin: 0; padding-top: 1.25rem; border-top: 1px solid $rule; font: 400 clamp(2.5rem, 8vw, 5rem)/1.05 Georgia, serif; letter-spacing: -.035em; }
+p { color: $muted; margin: 1.5rem 0 0; }
+</style>
+</head>
+<body><main><h1>$title</h1><p>$message</p></main></body>
+</html>
+EOF
+    chmod 644 "$temporary" && mv -fT -- "$temporary" "$index" || return 1
+    success "Страница установлена: $index"
+)
+
 full_setup() {
     local profile
     profile=$(choose_server_profile) || return 0
@@ -2382,33 +2703,70 @@ ${APP_NAME} ${APP_VERSION} — настройка, защита и ручная 
   sudo bash server_tool.sh          интерактивное меню
                                    пункт 1: нода или универсальный сервер
                                    пункт 11: ручная очистка сервера
+                                   пункт 12: HTML-шаблоны
+                                   пункт 13: диагностика ноды
   sudo bash server_tool.sh --status состояние сервера
   bash server_tool.sh --version     версия
   bash server_tool.sh --help        справка
 EOF
 }
 
-show_menu() {
-    local choice
+read_main_menu() {
+    local cursor=0 selected number='' key sequence next i mark color terminal=no
+    local firewall='выключен' crowdsec='выключен' govips ssh_port
+    local -a ids=(1 2 3 4 5 6 7 8 9 10 11 12 13 0)
+    local -a labels=('Полная настройка' 'Обновить систему' 'Настроить firewall и порты' 'Настроить SSH'
+        'Anti-Scanner, GOVIPS и GeoIP' 'CrowdSec' 'Установить XanMod' 'Включить BBR' 'Состояние сервера'
+        'Дополнительные TCP/UDP-порты' 'Очистка и диагностика диска' 'Установить HTML-шаблон' 'Диагностика ноды' 'Выход')
+    [[ ! -t 0 || ! -t 1 || ${TERM:-dumb} == dumb ]] || terminal=yes
+    nft list table inet server_tool_guard >/dev/null 2>&1 && firewall='активен'
+    systemctl is-active --quiet crowdsec 2>/dev/null && crowdsec='активен'
+    govips=$(read_guard_setting GOVIPS_MODE off) || govips='?'
+    ssh_port=$(detect_ssh_port)
     while true; do
-        clear 2>/dev/null || true
-        printf '%b╔══════════════════════════════════════════╗%b\n' "$CYAN" "$NC"
-        printf '%b║  🚀 ServerTool %-7s                  ║%b\n' "$CYAN" "v${APP_VERSION}" "$NC"
-        printf '%b╚══════════════════════════════════════════╝%b\n\n' "$CYAN" "$NC"
-        printf '  Профиль: %s\n\n' "$(profile_label)"
-        printf '  1) 🧰 Полная настройка: нода / универсальный сервер\n'
-        printf '  2) 🔄 Обновить систему\n'
-        printf '  3) 🔥 Настроить nftables и порты выбранного профиля\n'
-        printf '  4) 🔑 Настроить SSH\n'
-        printf '  5) 🛡️  Firewall, Anti-Scanner и Geo-block\n'
-        printf '  6) 🕵️  CrowdSec\n'
-        printf '  7) ⚡ Установить XanMod\n'
-        printf '  8) 🚄 Включить BBR\n'
-        printf '  9) 📊 Показать состояние\n'
-        printf ' 10) 🔓 Дополнительные TCP/UDP-порты\n'
-        printf ' 11) 🧹 Очистка сервера и диагностика диска\n'
-        printf '  0) 👋 Выход\n\n'
-        read -r -p "Выберите пункт: " choice || return 0
+        [[ $terminal != yes ]] || printf '\033[H\033[2J'
+        printf '%bServerTool%b  v%s\n' "$BOLD$CYAN" "$NC" "$APP_VERSION"
+        printf '%b─────────────────────────────────────────%b\n' "$CYAN" "$NC"
+        printf '  %-11s %s\n' 'Профиль' "$(profile_label)"
+        printf '  Firewall    %s    CrowdSec  %s\n' "$firewall" "$crowdsec"
+        printf '  SSH         %s/tcp    GOVIPS    %s\n\n' "$ssh_port" "$govips"
+        for i in "${!ids[@]}"; do
+            [[ $i != 8 && $i != 13 ]] || printf '\n'
+            mark=' '; color=''
+            if [[ $terminal == yes && $i == "$cursor" ]]; then mark='›'; color=$'\033[7m'; fi
+            printf ' %s %b%2s. %s%b\n' "$mark" "$color" "${ids[i]}" "${labels[i]}" "$NC"
+        done
+        if [[ $terminal != yes ]]; then
+            read -r -p 'Номер пункта: ' MENU_CHOICE
+            return
+        fi
+        printf '\n↑/↓ — выбор   Enter — открыть   Номер: %s' "$number"
+        read -rsn1 key || return 1
+        case $key in
+            '') MENU_CHOICE=${number:-${ids[cursor]}}; printf '\n'; return 0 ;;
+            [0-9])
+                if ((${#number} >= 2)); then number=''; fi
+                number+=$key
+                for i in "${!ids[@]}"; do [[ ${ids[i]} != "$number" ]] || cursor=$i; done
+                ;;
+            $'\177'|$'\b') number=${number%?} ;;
+            $'\e')
+                read -rsn1 -t 0.15 sequence || continue
+                [[ $sequence == '[' || $sequence == O ]] || continue
+                read -rsn1 -t 0.15 next || continue
+                selected=$cursor
+                case $next in A) selected=$((cursor - 1));; B) selected=$((cursor + 1));; *) continue;; esac
+                cursor=$(((selected + ${#ids[@]}) % ${#ids[@]}))
+                number=''
+                ;;
+        esac
+    done
+}
+
+show_menu() {
+    local choice MENU_CHOICE
+    while read_main_menu; do
+        choice=$MENU_CHOICE
         case $choice in
             1) full_setup; pause ;;
             2) system_update || error "Обновление не завершено."; pause ;;
@@ -2421,6 +2779,8 @@ show_menu() {
             9) show_status; pause ;;
             10) guard_ports_menu ;;
             11) cleanup_menu ;;
+            12) install_node_template || error 'Шаблон не установлен.'; pause ;;
+            13) show_node_diagnostics; pause ;;
             0) success "Готово. Не забудьте проверить новый SSH-вход."; return ;;
             *) warn "Неизвестный пункт."; sleep 1 ;;
         esac

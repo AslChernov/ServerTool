@@ -106,3 +106,21 @@ jobs:
           GEO_COUNTRIES=""
           EOF
           check_rules
+          sudo tee /etc/server-tool/guard.conf >/dev/null <<'EOF'
+          SERVER_ROLE="node"
+          SSH_PORT="35425"
+          SSH_SOURCES="192.0.2.10"
+          NODE_PORT="2222"
+          PANEL_IPV4="192.0.2.20"
+          HTTPS_MODE="tcp"
+          NODE_CLIENT_SOURCES="198.51.100.0/26 203.0.113.5"
+          EXTRA_TCP_PORTS="9443"
+          RESTRICTED_RULES=("udp|8443|192.0.2.40")
+          GOVIPS_MODE="monitor"
+          BLOCKLIST_URLS=()
+          EOF
+          printf '8.8.8.0/24\n' | sudo tee /var/lib/server-tool/blocklist-v4.txt >/dev/null
+          printf '9.9.9.0/24\n' | sudo tee /var/lib/server-tool/blocklist-v4.txt.govips >/dev/null
+          check_rules
+          sudo sed -i 's/GOVIPS_MODE="monitor"/GOVIPS_MODE="block"/' /etc/server-tool/guard.conf
+          check_rules

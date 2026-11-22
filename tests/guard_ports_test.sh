@@ -167,3 +167,59 @@ bash "$GUARD_UPDATER" --check
 grep -Fq 'ip saddr @panel_v4 tcp dport 2222 counter accept' "$work/checked.nft" || fail 'legacy config inherited caller server role'
 printf 'PASS: custom ports, legacy configs, menu, persistence, rule ordering and rollback\n'
 printf 'PASS: universal profile, IPv6, restricted access, disabled feeds and invalid rules\n'
+
+SERVER_ROLE=node
+CLIENT_SOURCES_TO_WRITE='192.0.2.8/29 198.51.100.1' GOVIPS_MODE_TO_WRITE=monitor \
+    write_guard_config 34464 2222 192.0.2.1 both '9443' '' '192.0.2.4' no yes \
+        'tcp|8443|203.0.113.0/24'
+write_guard_updater
+bash "$GUARD_UPDATER" --apply
+active="$work/applied.nft"
+grep -Fq 'elements = { 192.0.2.8/29, 198.51.100.1/32 }' "$active" || fail 'trusted 443 sources missing'
+grep -Fq 'ip saddr @node_clients_v4 tcp dport 443 counter accept' "$active" || fail 'trusted host TCP 443 rule missing'
+grep -Fq 'ct status dnat ip saddr @node_clients_v4 meta l4proto udp ct original proto-dst 443 counter accept' "$active" || fail 'trusted Docker UDP 443 rule missing'
+grep -Fq 'ct status dnat ip saddr 203.0.113.0/24 meta l4proto tcp ct original proto-dst 8443 counter accept' "$active" || fail 'restricted node port missing'
+grep -Fq 'ip saddr 192.0.2.4/32 tcp dport 34464 counter accept' "$active" || fail 'restricted node SSH missing'
+if grep -Eq 'tcp dport 443 jump|proto-dst 443 jump|meta nfproto ipv4 tcp dport 34464 counter accept' "$active"; then fail 'trusted-only service has a public rule'; fi
+grep -Fq 'ct state new ip saddr @govips_v4 counter comment "GOVIPS monitor"' "$active" || fail 'GOVIPS monitor blocks or counts unrelated traffic'
+grep -Fq 'ct status dnat meta nfproto ipv4 meta l4proto tcp ct original proto-dst @extra_tcp_ports jump public_node' "$active" || fail 'Docker policy is not scoped to published ports'
+if change_guard_port add tcp 8443 >/dev/null 2>&1; then fail 'restricted node port became public'; fi
+
+cat >> "$GUARD_CONFIG" <<'EOF'
+BLOCKLIST_URLS=("https://test.invalid/anti" "https://test.invalid/government")
+GOVIPS_MODE=block
+EOF
+curl() {
+    local output='' url=${*: -1:1}
+    while (($#)); do
+        if [[ $1 == -o ]]; then output=$2; break; fi
+        shift
+    done
+    case "$url" in
+        */anti)
+            if [[ ${MOCK_ROUND:-1} == 1 ]]; then printf '8.8.8.8\n' > "$output";
+            else printf '8.8.8.9\n' > "$output"; fi ;;
+        */government)
+            [[ ${MOCK_ROUND:-1} == 1 ]] || return 22
+            printf '9.9.9.9\n' > "$output" ;;
+        */blacklist-v4.txt)
+            if [[ ${MOCK_ROUND:-1} == 1 ]]; then printf '1.1.1.1\n' > "$output";
+            else printf '1.0.0.0/8\n' > "$output"; fi ;;
+        *) return 22 ;;
+    esac
+}
+export -f curl
+bash "$GUARD_UPDATER" --refresh
+grep -Fq 'ct state new ip saddr @govips_v4 counter drop comment "GOVIPS block"' "$active" || fail 'GOVIPS blocking rule missing'
+equal '1.1.1.1/32' "$(< "$work/cache/list.govips")" 'first GOVIPS refresh'
+export MOCK_ROUND=2 NFT_FAIL_CHECK=1
+before=$(< "$work/cache/list.sources.json")
+if bash "$GUARD_UPDATER" --refresh >/dev/null 2>&1; then fail 'invalid nft rules applied'; fi
+equal "$before" "$(< "$work/cache/list.sources.json")" 'failed nft check preserves the source snapshots'
+grep -Fq '8.8.8.8/32' "$work/cache/list" || fail 'failed nft check changed the persisted ruleset input'
+export NFT_FAIL_CHECK=0
+bash "$GUARD_UPDATER" --refresh
+grep -Fq '8.8.8.9/32' "$work/cache/list" || fail 'healthy source did not update independently'
+grep -Fq '9.9.9.9/32' "$work/cache/list" || fail 'failed source was dropped'
+equal '1.1.1.1/32' "$(< "$work/cache/list.govips")" 'coverage limit rejected a one-line /8 expansion'
+printf 'PASS: node allowlists, scoped GOVIPS, independent source refresh and rollback of invalid candidate\n'
