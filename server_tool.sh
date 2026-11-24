@@ -1634,6 +1634,91 @@ configure_govips() (
     success "Режим GOVIPS сохранён: $mode. Копия: $backup"
 )
 
+show_govips_stats() (
+    local mode work journal_status=available
+    mode=$(read_guard_setting GOVIPS_MODE off) || return 1
+    if [[ $mode != monitor ]]; then
+        info 'Мониторинг GOVIPS выключен.'
+        if [[ $mode == block ]]; then info 'GOVIPS работает в режиме блокировки.'; fi
+        return 0
+    fi
+
+    work=$(mktemp -d "${TMPDIR:-/tmp}/server-tool-govips.XXXXXX") || return 1
+    trap 'rm -rf -- "$work"' EXIT
+    if ! nft -j list chain inet server_tool_guard public_node > "$work/chain.json"; then
+        error 'Не удалось прочитать счётчики GOVIPS из firewall.'
+        return 1
+    fi
+    if ! nft -j list set inet server_tool_guard govips_v4 > "$work/set.json"; then
+        error 'Не удалось прочитать набор IPv4 GOVIPS из firewall.'
+        return 1
+    fi
+    journalctl --since yesterday --grep='ServerTool GOVIPS ' --quiet --no-pager \
+        --output=json --output-fields=MESSAGE _TRANSPORT=kernel > "$work/journal.jsonl" 2> "$work/journal-error" || :
+    # journalctl --grep exits nonzero when there are no matches.
+    [[ ! -s $work/journal-error ]] || journal_status=unavailable
+
+    printf '\n%bGOVIPS%b  ·  Наблюдение\n' "$BOLD$CYAN" "$NC"
+    printf '%b─────────────────────────────────────────%b\n' "$CYAN" "$NC"
+    python3 - "$work" "$journal_status" <<'PY'
+from collections import Counter
+from datetime import datetime
+import json
+from pathlib import Path
+import re
+import sys
+
+work = Path(sys.argv[1])
+chain = json.loads((work / "chain.json").read_text())["nftables"]
+monitor = next((item["rule"] for item in chain
+                if item.get("rule", {}).get("comment") == "GOVIPS monitor"), {})
+counter = next((statement["counter"] for statement in monitor.get("expr", []) if "counter" in statement), None)
+if counter is None:
+    raise SystemExit("  Правило наблюдения GOVIPS отсутствует в активном firewall.")
+
+sets = json.loads((work / "set.json").read_text())["nftables"]
+ipv4 = next(item["set"] for item in sets if "set" in item)
+entries = len(ipv4.get("elem", []))
+
+def row(label, value):
+    print(f"  {label:<22} {value}")
+
+row("IPv4-диапазоны", entries if entries else "0 · набор пуст")
+print("\n  С момента загрузки правил")
+row("Пакеты", counter["packets"])
+row("Объём", f'{counter["bytes"]:,}'.replace(",", " ") + " Б")
+
+print("\n  Журнал со вчерашнего дня · выборка")
+if sys.argv[2] == "unavailable":
+    print("  Журнал ядра недоступен.")
+    raise SystemExit(0)
+
+sources, ports = Counter(), Counter()
+total = last = 0
+with (work / "journal.jsonl").open(encoding="utf-8") as journal:
+    for line in journal:
+        entry = json.loads(line)
+        message = entry.get("MESSAGE")
+        if not isinstance(message, str) or "ServerTool GOVIPS " not in message:
+            continue
+        total += 1
+        last = max(last, int(entry.get("__REALTIME_TIMESTAMP", 0)))
+        source = re.search(r"\bSRC=([\d.]+)(?:\s|$)", message)
+        port = re.search(r"\bDPT=(\d+)(?:\s|$)", message)
+        if source:
+            sources[source[1]] += 1
+        if port:
+            ports[port[1]] += 1
+
+row("Записи", total)
+if last:
+    row("Последняя запись", datetime.fromtimestamp(last / 1_000_000).strftime("%d.%m.%Y %H:%M:%S"))
+for label, counts in (("Частые IP", sources), ("Частые порты", ports)):
+    for index, (value, count) in enumerate(counts.most_common(5)):
+        row(label if index == 0 else "", f"{value}  [{count}]")
+PY
+)
+
 guard_ports_menu() {
     require_root
     local choice port protocol action tcp_ports udp_ports verb
@@ -1687,6 +1772,7 @@ guard_menu() {
         printf '  5) Удалить только nftables-защиту\n'
         printf '  6) Дополнительные TCP/UDP-порты\n'
         printf '  7) GOVIPS: наблюдение, блокировка, выключение\n'
+        printf '  8) Статистика GOVIPS\n'
         printf '  0) Назад\n\n'
         read -r -p "Выбор: " choice || true
         case $choice in
@@ -1744,6 +1830,7 @@ guard_menu() {
                 ;;
             6) guard_ports_menu ;;
             7) configure_govips || warn 'Режим GOVIPS не применён.'; pause ;;
+            8) show_govips_stats || true; pause ;;
             0) return ;;
             *) warn "Неизвестный пункт."; sleep 1 ;;
         esac

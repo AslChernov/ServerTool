@@ -223,3 +223,49 @@ grep -Fq '8.8.8.9/32' "$work/cache/list" || fail 'healthy source did not update 
 grep -Fq '9.9.9.9/32' "$work/cache/list" || fail 'failed source was dropped'
 equal '1.1.1.1/32' "$(< "$work/cache/list.govips")" 'coverage limit rejected a one-line /8 expansion'
 printf 'PASS: node allowlists, scoped GOVIPS, independent source refresh and rollback of invalid candidate\n'
+
+(
+    ensure_packages() { :; }
+    write_stats_mode() { printf 'GOVIPS_MODE=%s\n' "$1" > "$GUARD_CONFIG"; }
+    nft() {
+        [[ $1 == -j && $2 == list ]] || fail 'statistics issued a non-read command'
+        case $3 in
+            chain) printf '%s\n' '{"nftables":[{"rule":{"comment":"GOVIPS monitor","expr":[{"counter":{"packets":12,"bytes":640}}]}}]}' ;;
+            set) printf '%s\n' "{\"nftables\":[{\"set\":{\"name\":\"govips_v4\"${set_entries:-}}}]}" ;;
+            *) fail 'unexpected nft query' ;;
+        esac
+    }
+    journalctl() {
+        [[ $* == *'--since'*'yesterday'* && $* == *'_TRANSPORT=kernel'* ]] || fail 'statistics queried the wrong journal'
+        case ${journal_fixture:-entries} in
+            empty) return 1 ;;
+            error) printf 'journal unavailable\n' >&2; return 1 ;;
+        esac
+        cat <<'EOF'
+{"MESSAGE":"ServerTool GOVIPS IN=eth0 SRC=192.0.2.2 DPT=443","__REALTIME_TIMESTAMP":"1795381200000000"}
+{"MESSAGE":"ServerTool GOVIPS IN=eth0 SRC=192.0.2.2 DPT=8443","__REALTIME_TIMESTAMP":"1795381220000000"}
+{"MESSAGE":"ServerTool GOVIPS IN=eth0 SRC=192.0.2.3 DPT=8443","__REALTIME_TIMESTAMP":"1795381240000000"}
+EOF
+    }
+    set_entries=',"elem":["192.0.2.2", "192.0.2.3"]'
+    write_stats_mode monitor
+    guard_menu <<< $'8\n\n0' > "$work/stats"
+    grep -Eq 'IPv4-диапазоны +2$' "$work/stats" || fail 'GOVIPS set count missing'
+    grep -Eq 'Пакеты +12$' "$work/stats" || fail 'GOVIPS packet count missing'
+    grep -Eq 'Записи +3$' "$work/stats" || fail 'GOVIPS journal count missing'
+    grep -Eq 'Частые IP +192\.0\.2\.2  \[2\]' "$work/stats" || fail 'GOVIPS source totals wrong'
+    grep -Eq 'Частые порты +8443  \[2\]' "$work/stats" || fail 'GOVIPS port totals wrong'
+    set_entries='' journal_fixture=empty show_govips_stats > "$work/stats"
+    grep -Fq '0 · набор пуст' "$work/stats" || fail 'empty GOVIPS set reported incorrectly'
+    grep -Eq 'Записи +0$' "$work/stats" || fail 'journal with no matches reported incorrectly'
+    journal_fixture=error show_govips_stats > "$work/stats"
+    grep -Fq 'Журнал ядра недоступен.' "$work/stats" || fail 'journal failure was not reported'
+    nft() { fail 'disabled monitor queried nft'; }
+    write_stats_mode off
+    show_govips_stats > "$work/stats"
+    grep -Fq 'Мониторинг GOVIPS выключен.' "$work/stats" || fail 'disabled monitor warning missing'
+    write_stats_mode block
+    show_govips_stats > "$work/stats"
+    grep -Fq 'GOVIPS работает в режиме блокировки.' "$work/stats" || fail 'blocking mode reported as monitoring'
+)
+printf 'PASS: GOVIPS statistics menu, counters, journal and disabled mode\n'
